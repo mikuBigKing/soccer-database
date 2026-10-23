@@ -5,3 +5,5 @@ django-filter>=26.2
 Pillow>=11.3
 python-dotenv>=1.0
 requests>=2.34
+python-docx>=1.1
+openpyxl>=3.1

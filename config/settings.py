@@ -42,6 +42,7 @@ INSTALLED_APPS = [
     'apps.org',
     'apps.live',
     'apps.athlete',
+    'apps.registration',
 ]
 
 MIDDLEWARE = [

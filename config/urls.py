@@ -23,6 +23,9 @@ urlpatterns = [
     path('api/admin/', include('apps.org.urls')),
     path('api/', include('apps.org.urls_city')),
     path('api/athlete/', include('apps.athlete.urls')),
+    path('api/', include('apps.registration.urls')),
+    path('api/city/', include('apps.registration.urls_city')),
+    path('api/province/', include('apps.registration.urls_province')),
 ]
 
 if settings.DEBUG:

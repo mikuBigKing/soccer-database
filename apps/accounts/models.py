@@ -133,6 +133,8 @@ class CoachProfile(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_public = models.BooleanField('是否公示', default=False, db_index=True)
+    deleted_at = models.DateTimeField('软删除时间', null=True, blank=True)
 
     class Meta:
         db_table = 'coach_profiles'
@@ -154,6 +156,8 @@ class AthleteProfile(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_public = models.BooleanField('是否公示', default=False, db_index=True)
+    deleted_at = models.DateTimeField('软删除时间', null=True, blank=True)
 
     class Meta:
         db_table = 'athlete_profiles'

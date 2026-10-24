@@ -43,6 +43,7 @@ INSTALLED_APPS = [
     'apps.live',
     'apps.athlete',
     'apps.registration',
+    'apps.admin_console',
 ]
 
 MIDDLEWARE = [
@@ -121,6 +122,9 @@ PRIVATE_STORAGE_ROOT = BASE_DIR / 'storage' / 'private'
 
 MAX_IMAGE_SIZE = int(os.getenv('MAX_IMAGE_SIZE', str(10 * 1024 * 1024)))
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', str(10 * 1024 * 1024)))
+
+# 管理员重置球员/教练登录密码后的默认密码（任何日志/响应都不落明文）
+DEFAULT_RESET_PASSWORD = os.getenv('DEFAULT_RESET_PASSWORD', 'Abc@123456')
 
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024

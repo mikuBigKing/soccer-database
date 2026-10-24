@@ -32,6 +32,7 @@ class ResponseCode(IntEnum):
 
     # 400xx 业务规则
     OPTIMISTIC_LOCK_CONFLICT = 9
+    BUSINESS_ERROR = 40001
     MATCH_FINISHED_LOCKED = 40002
     DUPLICATE_SUBMIT = 40009
 
@@ -56,6 +57,7 @@ MESSAGES = {
     ResponseCode.FORBIDDEN: '无操作权限',
     ResponseCode.NOT_FOUND: '资源不存在',
     ResponseCode.OPTIMISTIC_LOCK_CONFLICT: '数据已被他人修改，请刷新后重试',
+    ResponseCode.BUSINESS_ERROR: '业务处理失败',
     ResponseCode.MATCH_FINISHED_LOCKED: '比赛已结束，禁止修改',
     ResponseCode.DUPLICATE_SUBMIT: '请勿重复提交',
     ResponseCode.FACE_VERIFY_FAILED: '人脸核验服务异常',

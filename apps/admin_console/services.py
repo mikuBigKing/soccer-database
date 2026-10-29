@@ -11,12 +11,12 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus
+from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, UserStatus
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.formatting import format_dt
 from apps.common.pagination import paginate
-from apps.org.models import Team
+from apps.org.models import Team, TeamStatus
 
 from .masking import mask_id_card, mask_phone
 from .models import AdminOperationLog
@@ -29,10 +29,23 @@ User = get_user_model()
 # ---------------------------------------------------------------------------
 
 def _client_ip(request) -> str:
-    forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')
-    if forwarded:
-        return forwarded.split(',')[0].strip()[:64]
-    return (request.META.get('REMOTE_ADDR') or '')[:64]
+    """来源 IP。
+
+    仅当直连地址（REMOTE_ADDR）在受信代理名单内时才采信 X-Forwarded-For 首值，
+    防止客户端随手伪造审计日志来源；名单缺省为空集合（不信任 XFF）。
+
+    将来部署在 Nginx 后，在 settings 补 TRUSTED_PROXY_IPS = ['127.0.0.1', '10.0.0.5']
+    即可生效（本次改动范围限定在本模块，不动 settings）。
+    """
+    remote_addr = (request.META.get('REMOTE_ADDR') or '')[:64]
+    trusted = set(getattr(settings, 'TRUSTED_PROXY_IPS', []) or [])
+    if remote_addr in trusted:
+        forwarded = request.META.get('HTTP_X_FORWARDED_FOR', '')
+        if forwarded:
+            candidate = forwarded.split(',')[0].strip()
+            if candidate:
+                return candidate[:64]
+    return remote_addr
 
 
 def _log(request, action: str, target_type: str, target_id: int, before=None, after=None) -> None:
@@ -48,18 +61,80 @@ def _log(request, action: str, target_type: str, target_id: int, before=None, af
     )
 
 
-def _ensure_phone_available(phone: str, exclude_user_id: int) -> None:
-    if User.objects.filter(phone=phone).exclude(pk=exclude_user_id).exists():
+def _sync_user_phone(user, new_phone: str) -> bool:
+    """同步账号手机号与登录标识（注册约定 `username = phone`）。
+
+    返回是否发生变化。手机号 / username 均查重并排除自己：
+    - 手机号冲突：`phone: 该手机号已被使用`
+    - username 冲突：`username: 该手机号已被占用`
+    """
+    if user.phone == new_phone and user.username == new_phone:
+        return False
+    if User.objects.filter(phone=new_phone).exclude(pk=user.pk).exists():
         raise BusinessException(ResponseCode.PARAM_INVALID, 'phone: 该手机号已被使用')
+    if User.objects.filter(username=new_phone).exclude(pk=user.pk).exists():
+        raise BusinessException(ResponseCode.PARAM_INVALID, 'username: 该手机号已被占用')
+    user.phone = new_phone
+    user.username = new_phone
+    return True
+
+
+def _ensure_id_card_available(id_card: str, profile_model, exclude_pk: int) -> None:
+    """同类型档案内校验身份证唯一（应用层校验，暂不加 DB 约束）。
+
+    历史数据可能已有重复，加 unique 会导致迁移失败，故只在应用层拦截；
+    已软删的记录不参与占用判断。
+    """
+    if not id_card:
+        return
+    exists = (profile_model.objects
+              .filter(id_card=id_card, deleted_at__isnull=True)
+              .exclude(pk=exclude_pk)
+              .exists())
+    if exists:
+        raise BusinessException(ResponseCode.PARAM_INVALID, 'id_card: 该身份证号已被使用')
+
+
+def _disable_user_account(user) -> None:
+    """软删档案的同时禁用登录账号，避免「已删除的人还能登录」。"""
+    if user is None:
+        return
+    fields = []
+    if user.status != UserStatus.DISABLED:
+        user.status = UserStatus.DISABLED
+        fields.append('status')
+    if user.is_active:
+        user.is_active = False
+        fields.append('is_active')
+    if fields:
+        user.save(update_fields=fields)
+
+
+def _paginate(qs, request) -> dict:
+    """分页包装：把越界回显的 page 修正为实际返回内容所在页。
+
+    公共 `paginate()` 在页码越界时内容已回退到最后一页，但 `page` 仍回显请求值，
+    前端会误以为在看第 99 页。这里按 total/page_size 反算真实页码后覆盖，
+    不动 `apps/common/pagination.py`。page_size 用公共分页夹过的值（1–100）。
+    """
+    data = paginate(qs, request)
+    page_size = data['page_size'] or 1
+    total_pages = max(1, (data['total'] + page_size - 1) // page_size)
+    data['page'] = min(data['page'], total_pages)
+    return data
 
 
 # ---------------------------------------------------------------------------
 # 球员
 # ---------------------------------------------------------------------------
 
-def _get_player(pk: int) -> AthleteProfile:
+def _get_player(pk: int, for_update: bool = False) -> AthleteProfile:
+    qs = AthleteProfile.objects.select_related('user', 'team')
+    if for_update:
+        # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
+        qs = qs.select_for_update()
     try:
-        return AthleteProfile.objects.select_related('user', 'team').get(pk=pk, deleted_at__isnull=True)
+        return qs.get(pk=pk, deleted_at__isnull=True)
     except AthleteProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
 
@@ -101,7 +176,7 @@ def list_players(request, params: dict) -> dict:
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
     if params.get('id_card'):
-        qs = qs.filter(id_card=params['id_card'])
+        qs = qs.filter(id_card__iexact=params['id_card'])
     if 'jersey_no' in params:
         qs = qs.filter(jersey_no=params['jersey_no'])
     if 'team_id' in params:
@@ -120,7 +195,7 @@ def list_players(request, params: dict) -> dict:
             | Q(id_card__icontains=keyword)
         )
 
-    data = paginate(qs, request)
+    data = _paginate(qs, request)
     data['list'] = [_player_list_item(profile) for profile in data['list']]
     return data
 
@@ -142,6 +217,8 @@ def update_player(request, pk: int, data: dict) -> dict:
         'avatar': 'avatar_path',
         'id_card': 'id_card',
     }
+    if data.get('id_card'):
+        _ensure_id_card_available(data['id_card'], AthleteProfile, player.pk)
     for source, target in field_map.items():
         if source in data:
             setattr(player, target, data[source])
@@ -149,9 +226,7 @@ def update_player(request, pk: int, data: dict) -> dict:
 
     phone_changed = False
     if 'phone' in data:
-        _ensure_phone_available(data['phone'], player.user_id)
-        player.user.phone = data['phone']
-        phone_changed = True
+        phone_changed = _sync_user_phone(player.user, data['phone'])
 
     if not changed and not phone_changed:
         return before
@@ -161,7 +236,7 @@ def update_player(request, pk: int, data: dict) -> dict:
         player.updated_at = now
         player.save(update_fields=changed + ['updated_at'])
     if phone_changed:
-        player.user.save(update_fields=['phone'])
+        player.user.save(update_fields=['phone', 'username'])
 
     after = _player_detail(player)
     _log(request, '修改球员', 'player', player.id, before, after)
@@ -170,8 +245,10 @@ def update_player(request, pk: int, data: dict) -> dict:
 
 @transaction.atomic
 def delete_player(request, pk: int) -> dict:
-    player = _get_player(pk)
-    if player.team_id:
+    player = _get_player(pk, for_update=True)
+    # 只拦「待审核 / 已通过」的球队；球队已驳回时球员可删除
+    if (player.team_id
+            and player.team.status in (TeamStatus.PENDING, TeamStatus.APPROVED)):
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员已加入球队，不可删除')
 
     before = _player_detail(player)
@@ -184,13 +261,16 @@ def delete_player(request, pk: int) -> dict:
         fields.append('is_public')
     player.save(update_fields=fields)
 
+    # 软删档案的同时禁用账号，避免「已删除的人仍能登录」
+    _disable_user_account(player.user)
+
     _log(request, '删除球员', 'player', player.id, before, None)
     return {'id': player.id, 'deleted': True}
 
 
 @transaction.atomic
 def publish_player(request, pk: int) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, for_update=True)
     if player.status != ProfileStatus.APPROVED:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅审核通过的球员可公示')
     if player.is_public:
@@ -207,7 +287,7 @@ def publish_player(request, pk: int) -> dict:
 
 @transaction.atomic
 def unpublish_player(request, pk: int) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, for_update=True)
     if not player.is_public:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员未公示')
 
@@ -234,9 +314,13 @@ def reset_player_password(request, pk: int) -> dict:
 # 教练员
 # ---------------------------------------------------------------------------
 
-def _get_coach(pk: int) -> CoachProfile:
+def _get_coach(pk: int, for_update: bool = False) -> CoachProfile:
+    qs = CoachProfile.objects.select_related('user')
+    if for_update:
+        # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
+        qs = qs.select_for_update()
     try:
-        return CoachProfile.objects.select_related('user').get(pk=pk, deleted_at__isnull=True)
+        return qs.get(pk=pk, deleted_at__isnull=True)
     except CoachProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '教练员不存在', status_code=404)
 
@@ -275,7 +359,7 @@ def list_coaches(request, params: dict) -> dict:
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
     if params.get('id_card'):
-        qs = qs.filter(id_card=params['id_card'])
+        qs = qs.filter(id_card__iexact=params['id_card'])
     if 'team_id' in params:
         qs = qs.filter(user__coached_teams__id=params['team_id'])
     if params.get('group_type'):
@@ -294,7 +378,7 @@ def list_coaches(request, params: dict) -> dict:
     if 'team_id' in params or params.get('group_type'):
         qs = qs.distinct()
 
-    data = paginate(qs, request)
+    data = _paginate(qs, request)
     data['list'] = [_coach_list_item(profile) for profile in data['list']]
     return data
 
@@ -315,16 +399,25 @@ def update_coach(request, pk: int, data: dict) -> dict:
         'id_card': 'id_card',
         'qualification': 'qualification_path',
     }
+    if data.get('id_card'):
+        _ensure_id_card_available(data['id_card'], CoachProfile, coach.pk)
     for source, target in field_map.items():
         if source in data:
             setattr(coach, target, data[source])
             changed.append(target)
+
+    phone_changed = False
+    if 'phone' in data:
+        # 登录按 User.phone 查账号，档案手机号必须与账号同步
+        phone_changed = _sync_user_phone(coach.user, data['phone'])
 
     if not changed:
         return before
 
     coach.updated_at = timezone.now()
     coach.save(update_fields=changed + ['updated_at'])
+    if phone_changed:
+        coach.user.save(update_fields=['phone', 'username'])
 
     after = _coach_detail(coach)
     _log(request, '修改教练员', 'coach', coach.id, before, after)
@@ -333,8 +426,12 @@ def update_coach(request, pk: int, data: dict) -> dict:
 
 @transaction.atomic
 def delete_coach(request, pk: int) -> dict:
-    coach = _get_coach(pk)
-    if Team.objects.filter(coach=coach.user).exists():
+    coach = _get_coach(pk, for_update=True)
+    # 只拦「待审核 / 已通过」的球队；球队已驳回时教练可删除
+    if Team.objects.filter(
+        coach=coach.user,
+        status__in=[TeamStatus.PENDING, TeamStatus.APPROVED],
+    ).exists():
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员有在执球队，不可删除')
 
     before = _coach_detail(coach)
@@ -347,13 +444,16 @@ def delete_coach(request, pk: int) -> dict:
         fields.append('is_public')
     coach.save(update_fields=fields)
 
+    # 软删档案的同时禁用账号，避免「已删除的人仍能登录」
+    _disable_user_account(coach.user)
+
     _log(request, '删除教练员', 'coach', coach.id, before, None)
     return {'id': coach.id, 'deleted': True}
 
 
 @transaction.atomic
 def publish_coach(request, pk: int) -> dict:
-    coach = _get_coach(pk)
+    coach = _get_coach(pk, for_update=True)
     if coach.status != ProfileStatus.APPROVED:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅审核通过的教练员可公示')
     if coach.is_public:
@@ -370,7 +470,7 @@ def publish_coach(request, pk: int) -> dict:
 
 @transaction.atomic
 def unpublish_coach(request, pk: int) -> dict:
-    coach = _get_coach(pk)
+    coach = _get_coach(pk, for_update=True)
     if not coach.is_public:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员未公示')
 

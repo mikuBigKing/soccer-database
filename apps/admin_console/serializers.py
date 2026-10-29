@@ -53,6 +53,10 @@ class PlayerQuerySerializer(serializers.Serializer):
 
     is_public = QueryBooleanField(required=False, error_messages={'invalid': '取值不合法'})
 
+    def validate_id_card(self, value):
+        # 归一化大小写，便于 `id_card__iexact` 精确匹配；搜索参数保持宽松，不校验 18 位
+        return (value or '').strip().upper()
+
 
 class CoachQuerySerializer(serializers.Serializer):
     page = serializers.IntegerField(required=False, min_value=1, error_messages=INT_ERRORS)
@@ -64,6 +68,10 @@ class CoachQuerySerializer(serializers.Serializer):
     group_type = serializers.ChoiceField(required=False, choices=GroupType.choices, error_messages=CHOICE_ERRORS)
     status = serializers.ChoiceField(required=False, choices=ProfileStatus.choices, error_messages=CHOICE_ERRORS)
     is_public = QueryBooleanField(required=False, error_messages={'invalid': '取值不合法'})
+
+    def validate_id_card(self, value):
+        # 归一化大小写，便于 `id_card__iexact` 精确匹配；搜索参数保持宽松，不校验 18 位
+        return (value or '').strip().upper()
 
 
 class PlayerUpdateSerializer(serializers.Serializer):

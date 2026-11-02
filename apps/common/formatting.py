@@ -17,3 +17,14 @@ def format_date(value) -> str:
     if value is None:
         return None
     return value.strftime(DATE_FORMAT)
+
+
+def mask_id_card(value) -> str:
+    """身份证号脱敏：仅保留前 3 位与后 4 位，中间以 * 替换（不足时全量打码）。"""
+    if not value:
+        return value
+    s = str(value)
+    n = len(s)
+    if n <= 7:
+        return '*' * n
+    return s[:3] + '*' * (n - 7) + s[-4:]

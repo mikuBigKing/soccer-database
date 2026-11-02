@@ -1,8 +1,9 @@
-"""用户与 7 角色 profile 模型（对应 Laravel users + *_profiles 迁移）。
+"""用户与 8 角色 profile 模型（对应 Laravel users + *_profiles 迁移）。
 
 账号方案 C：users 主表 + 各角色 profile 表。
 - 管理员用 email + password 登录（独立登录页）
-- 其余 6 种角色用 phone + password 登录（统一登录页）
+- 其余 7 种角色用 phone + password 登录（统一登录页）
+- 区县级（county）不设独立端，并入市州端使用，数据范围按区县裁剪
 """
 from django.contrib.auth.models import AbstractUser
 from django.db import models
@@ -12,6 +13,7 @@ class UserRole(models.TextChoices):
     ADMIN = 'admin', '管理员'
     PROVINCE = 'province', '省级'
     CITY = 'city', '市级'
+    COUNTY = 'county', '区县级'
     SCHOOL = 'school', '校级'
     COACH = 'coach', '教练'
     ATHLETE = 'athlete', '运动员'
@@ -71,6 +73,7 @@ class User(AbstractUser):
             UserRole.ADMIN: 'admin_profile',
             UserRole.PROVINCE: 'province_profile',
             UserRole.CITY: 'city_profile',
+            UserRole.COUNTY: 'county_profile',
             UserRole.SCHOOL: 'school_profile',
             UserRole.COACH: 'coach_profile',
             UserRole.ATHLETE: 'athlete_profile',
@@ -109,6 +112,20 @@ class CityProfile(models.Model):
 
     class Meta:
         db_table = 'city_profiles'
+
+
+class CountyProfile(models.Model):
+    """区县级账号：并入市州端使用，数据范围按 city + county 裁剪。"""
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='county_profile')
+    city = models.ForeignKey('org.City', null=True, blank=True, on_delete=models.SET_NULL, related_name='+')
+    county = models.CharField('区县名称', max_length=50, null=True, blank=True)
+    name = models.CharField('姓名', max_length=50)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'county_profiles'
 
 
 class SchoolProfile(models.Model):

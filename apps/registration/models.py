@@ -62,6 +62,8 @@ class Registration(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     stamped_form_path = models.CharField('盖章报名表扫描件路径', max_length=255, null=True, blank=True)
     stamped_form_name = models.CharField('盖章报名表扫描件文件名', max_length=255, null=True, blank=True)
+    archived_at = models.DateTimeField('归档时间', null=True, blank=True)
+    archived_by = models.BigIntegerField('归档人 user_id', null=True, blank=True)
     submitted_at = models.DateTimeField('提交时间', null=True, blank=True)
     city_reviewed_by = models.BigIntegerField('市州审核人 user_id', null=True, blank=True)
     city_reviewed_at = models.DateTimeField('市州审核时间', null=True, blank=True)
@@ -110,10 +112,13 @@ class RegistrationLog(models.Model):
         AVATAR_UPLOAD = 'avatar_upload', '头像上传'
         FORM_DOWNLOAD = 'form_download', '报名表Word下载'
         EXPORT = 'export', '报名情况导出'
+        ARCHIVE = 'archive', '资料归档'
         ACCOUNT_CREATE = 'account_create', '账号创建'
         ACCOUNT_UPDATE = 'account_update', '账号修改'
         ACCOUNT_DELETE = 'account_delete', '账号删除'
         IDENTITY_UPDATE = 'identity_update', '身份信息修改'
+        IDENTITY_APPROVE = 'identity_approve', '实名认证通过'
+        IDENTITY_REJECT = 'identity_reject', '实名认证驳回'
 
     registration = models.ForeignKey(
         Registration, null=True, blank=True, on_delete=models.SET_NULL, related_name='logs'

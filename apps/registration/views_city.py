@@ -14,7 +14,6 @@
 from django.db.models import Count, Q
 from rest_framework.response import Response
 from rest_framework.views import APIView
-
 from apps.accounts.models import AthleteProfile, CoachProfile
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
@@ -30,12 +29,15 @@ from apps.registration.serializers import (
 from apps.registration.services import (
     RegistrationService,
     _city_id_of,
+    _county_of,
     _get_registration,
+    check_completeness,
     filter_registrations,
     material_download,
 )
 
-CityOnly = role_permission('city')
+# 市州端与区县级共用入口：county 角色数据范围按区县裁剪
+CityOnly = role_permission('city', 'county')
 
 
 def _city_queryset(request):
@@ -45,7 +47,15 @@ def _city_queryset(request):
     city_id = _city_id_of(request.user)
     if not city_id:
         return queryset.none()
-    return queryset.filter(team__school__city_id=city_id)
+    queryset = queryset.filter(team__school__city_id=city_id)
+    county = _county_of(request.user)
+    if county:
+        queryset = queryset.filter(team__school__county=county)
+    return queryset
+
+
+def _annotate_player_count(queryset):
+    return queryset.annotate(player_count=Count('team__athletes', distinct=True))
 
 
 def _ensure_city_registration(request, pk: int) -> Registration:
@@ -58,7 +68,7 @@ class CityRegistrationListView(APIView):
     permission_classes = [CityOnly]
 
     def get(self, request):
-        queryset = filter_registrations(_city_queryset(request), request.query_params)
+        queryset = filter_registrations(_annotate_player_count(_city_queryset(request)), request.query_params)
         return Response(paginated_response(queryset, request, RegistrationListSerializer))
 
 
@@ -67,6 +77,16 @@ class CityRegistrationDetailView(APIView):
 
     def get(self, request, pk: int):
         return Response(RegistrationDetailSerializer(_ensure_city_registration(request, pk)).data)
+
+
+class CityRegistrationCompletenessView(APIView):
+    """报名资料完整度校验：返回各项齐备情况与缺失清单。"""
+
+    permission_classes = [CityOnly]
+
+    def get(self, request, pk: int):
+        registration = _ensure_city_registration(request, pk)
+        return Response(check_completeness(registration))
 
 
 class CityRegistrationApproveView(APIView):
@@ -106,6 +126,16 @@ class CityRegistrationBatchReportView(APIView):
         return Response(RegistrationService().report_batch(request.user, serializer.validated_data['ids']))
 
 
+class CityRegistrationArchiveView(APIView):
+    """报名资料归档：归档后资料锁定不可再上传/修改。"""
+
+    permission_classes = [CityOnly]
+
+    def post(self, request, pk: int):
+        registration = RegistrationService().archive(request.user, _get_registration(pk))
+        return Response(RegistrationDetailSerializer(registration).data)
+
+
 class CityRegistrationSummaryView(APIView):
     """全市汇总：按学校、按组别统计报名单状态分布。"""
 
@@ -138,7 +168,11 @@ class CityRegistrationSummaryView(APIView):
             .annotate(**{s: Count('id', filter=Q(status=s)) for s, _ in Registration.Status.choices})
             .order_by('team__group_type')
         )
+        county = _county_of(request.user)
+        scope = 'county' if county else ('city' if not is_admin(request.user) else 'all')
         return Response({
+            'scope': scope,
+            'county': county,
             'by_school': status_counts(by_school_rows, 'team__school__name'),
             'by_group': status_counts(by_group_rows, 'team__group_type'),
             'total': queryset.count(),
@@ -160,8 +194,12 @@ class CityEnrollmentCertDownloadView(APIView):
         profile = AthleteProfile.objects.filter(pk=pk).select_related('team__school').first()
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
-        if not is_admin(request.user) and profile.team and profile.team.school.city_id != _city_id_of(request.user):
-            raise BusinessException(ResponseCode.FORBIDDEN, '仅可下载本市州球员的材料')
+        if not is_admin(request.user):
+            if not profile.team or profile.team.school.city_id != _city_id_of(request.user):
+                raise BusinessException(ResponseCode.FORBIDDEN, '仅可下载本市州球员的材料')
+            county = _county_of(request.user)
+            if county and profile.team.school.county != county:
+                raise BusinessException(ResponseCode.FORBIDDEN, '仅可下载本区县球员的材料')
         return material_download(profile.enrollment_cert_path, profile.enrollment_cert_name)
 
 
@@ -176,6 +214,10 @@ class CityCoachQualificationDownloadView(APIView):
             from apps.org.models import Team
 
             city_id = _city_id_of(request.user)
-            if not Team.objects.filter(coach=profile.user, school__city_id=city_id).exists():
+            team_qs = Team.objects.filter(coach=profile.user, school__city_id=city_id)
+            county = _county_of(request.user)
+            if county:
+                team_qs = team_qs.filter(school__county=county)
+            if not team_qs.exists():
                 raise BusinessException(ResponseCode.FORBIDDEN, '仅可下载本市州教练的材料')
         return material_download(profile.qualification_path, profile.qualification_name)

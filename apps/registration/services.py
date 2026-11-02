@@ -7,9 +7,10 @@ import uuid
 from django.conf import settings
 from django.utils import timezone
 
-from apps.accounts.models import AthleteProfile, CoachProfile
+from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, UserRole
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
+from apps.common.formatting import mask_id_card
 from apps.org.models import Team
 
 from .models import Competition, Registration, RegistrationLog
@@ -88,6 +89,66 @@ def _city_id_of(user):
     return profile.city_id if profile and profile.city_id else None
 
 
+def _county_of(user):
+    """区县级账号的区县名称（city 角色返回 None 表示不裁剪区县）。"""
+    profile = user.role_profile()
+    if profile and user.role == UserRole.COUNTY:
+        return getattr(profile, 'county', None)
+    return None
+
+
+def check_completeness(registration: Registration) -> dict:
+    """报名资料完整度校验：返回各项是否齐备及缺失清单。
+
+    规则（与用户确认：球队完善信息后方可报名）：
+    - 盖章报名表扫描件
+    - 球队教练姓名 + 资质附件
+    - 球员人数 >= 1，且每名球员已上传学籍验证材料
+    """
+    team = registration.team
+    coach = CoachProfile.objects.filter(user=team.coach).first()
+    athletes = list(AthleteProfile.objects.filter(team=team))
+
+    items = []
+
+    stamped_ok = bool(registration.stamped_form_path)
+    items.append({'key': 'stamped_form', 'label': '盖章报名表扫描件', 'ok': stamped_ok,
+                  'missing': [] if stamped_ok else ['未上传盖章报名表扫描件']})
+
+    coach_name_ok = bool(coach and coach.name)
+    coach_qual_ok = bool(coach and coach.qualification_path)
+    coach_verified_ok = bool(coach and coach.status == ProfileStatus.APPROVED)
+    coach_missing = []
+    if not coach_name_ok:
+        coach_missing.append('教练姓名')
+    if not coach_qual_ok:
+        coach_missing.append('教练资质附件')
+    if not coach_verified_ok:
+        coach_missing.append('教练实名认证未通过')
+    items.append({'key': 'coach', 'label': '教练信息', 'ok': not coach_missing, 'missing': coach_missing})
+
+    players_ok = len(athletes) >= 1
+    players_missing = [] if players_ok else ['球队暂无球员']
+    players_without_cert = [a.name for a in athletes if not a.enrollment_cert_path]
+    if players_without_cert:
+        players_missing.append(f'以下球员未上传学籍材料：{", ".join(players_without_cert)}')
+    players_unverified = [a.name for a in athletes if a.status != ProfileStatus.APPROVED]
+    if players_unverified:
+        players_missing.append(f'以下球员实名认证未通过：{", ".join(players_unverified)}')
+    items.append({'key': 'players', 'label': '球员名单与学籍材料',
+                  'ok': players_ok and not players_without_cert and not players_unverified,
+                  'total': len(athletes),
+                  'missing': players_missing})
+
+    all_ok = all(it['ok'] for it in items)
+    missing = [m for it in items for m in it['missing']]
+    return {
+        'complete': all_ok,
+        'items': items,
+        'missing': missing,
+    }
+
+
 class RegistrationService:
     """报名单流转服务。"""
 
@@ -121,8 +182,10 @@ class RegistrationService:
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可提交本校/本队的报名单')
         if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
             raise BusinessException(ResponseCode.PARAM_INVALID, '当前状态不可提交')
-        if not registration.stamped_form_path:
-            raise BusinessException(ResponseCode.PARAM_INVALID, '请先上传盖章报名表扫描件')
+        completeness = check_completeness(registration)
+        if not completeness['complete']:
+            raise BusinessException(ResponseCode.PARAM_INVALID,
+                                    '报名资料不完整：' + '；'.join(completeness['missing']))
 
         registration.status = Registration.Status.SUBMITTED
         registration.reject_level = None
@@ -135,6 +198,8 @@ class RegistrationService:
     def upload_stamped_form(self, user, registration: Registration, uploaded_file) -> Registration:
         if registration.team_id not in _submitter_team_ids(user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本校/本队的报名单')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可更换资料')
         if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
             raise BusinessException(ResponseCode.PARAM_INVALID, '审核中或已通过的报名单不可更换扫描件')
         path, name = self.materials.save(f'registrations/{registration.pk}', uploaded_file, MaterialService.SCAN_EXTS)
@@ -155,6 +220,9 @@ class RegistrationService:
             return
         if registration.city.pk != _city_id_of(user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本市州的报名单')
+        county = _county_of(user)
+        if county and registration.school.county != county:
+            raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本区县的报名单')
 
     def city_review(self, user, registration: Registration, approve: bool, reason: str = '') -> Registration:
         self._ensure_city_scope(user, registration)
@@ -201,6 +269,23 @@ class RegistrationService:
             except BusinessException as exc:
                 failed.append({'id': pk, 'msg': exc.msg})
         return {'reported': done, 'failed': failed}
+
+    def archive(self, user, registration: Registration) -> Registration:
+        """报名资料归档：归档后资料锁定，不可再上传/修改。"""
+        self._ensure_city_scope(user, registration)
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该报名单已归档')
+        if registration.status not in (
+            Registration.Status.CITY_APPROVED,
+            Registration.Status.REPORTED,
+            Registration.Status.APPROVED,
+        ):
+            raise BusinessException(ResponseCode.PARAM_INVALID, '仅审核通过后的报名单可归档')
+        registration.archived_at = timezone.now()
+        registration.archived_by = user.pk
+        registration.save(update_fields=['archived_at', 'archived_by', 'updated_at'])
+        write_log(RegistrationLog.Action.ARCHIVE, user, registration)
+        return registration
 
     # ---------- 省级端 ----------
 
@@ -286,7 +371,10 @@ class ExportService:
         doc.add_paragraph(f'市州：{city.name}    学校：{school.name}')
         doc.add_paragraph(f'球队：{team.name}    组别：{team.get_group_type_display()}')
         if coach:
-            doc.add_paragraph(f'教练员：{coach.name}    联系电话：{coach.phone or ""}    身份证号：{coach.id_card or ""}')
+            doc.add_paragraph(
+                f'教练员：{coach.name}    联系电话：{coach.phone or ""}    '
+                f'身份证号：{mask_id_card(coach.id_card) or ""}'
+            )
         doc.add_paragraph(f'报名状态：{registration.get_status_display()}    提交时间：'
                           f'{timezone.localtime(registration.submitted_at).strftime("%Y-%m-%d %H:%M") if registration.submitted_at else ""}')
 
@@ -299,7 +387,7 @@ class ExportService:
             row = table.add_row().cells
             row[0].text = str(a.jersey_no or '')
             row[1].text = a.name
-            row[2].text = a.id_card or ''
+            row[2].text = mask_id_card(a.id_card) or ''
             row[3].text = a.position or ''
             row[4].text = '已上传' if a.enrollment_cert_path else '未上传'
 

@@ -34,6 +34,8 @@ def profile_summary(user):
         return {'id': profile.id, 'school_id': profile.school_id, 'name': profile.name}
     if user.role == UserRole.CITY:
         return {'id': profile.id, 'city_id': profile.city_id, 'name': profile.name}
+    if user.role == UserRole.COUNTY:
+        return {'id': profile.id, 'city_id': profile.city_id, 'county': profile.county, 'name': profile.name}
     if user.role == UserRole.PROVINCE:
         return {'id': profile.id, 'province_id': profile.province_id, 'name': profile.name}
     return {'id': profile.id, 'name': profile.name}

@@ -51,6 +51,7 @@ class School(models.Model):
         DISABLED = 'disabled', '已停用'
 
     city = models.ForeignKey(City, on_delete=models.CASCADE, related_name='schools')
+    county = models.CharField('所属区县', max_length=50, null=True, blank=True)
     name = models.CharField('学校名称', max_length=150)
     logo = models.CharField('Logo 路径', max_length=255, null=True, blank=True)
     address = models.CharField('地址', max_length=255, null=True, blank=True)
@@ -62,7 +63,10 @@ class School(models.Model):
     class Meta:
         db_table = 'schools'
         ordering = ['id']
-        indexes = [models.Index(fields=['city', 'status'])]
+        indexes = [
+            models.Index(fields=['city', 'status']),
+            models.Index(fields=['city', 'county']),
+        ]
 
     def __str__(self):
         return self.name

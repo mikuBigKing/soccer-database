@@ -2,6 +2,7 @@
 from rest_framework import serializers
 
 from apps.accounts.models import AthleteProfile, CoachProfile
+from apps.common.formatting import mask_id_card
 
 from .models import Competition, Registration, RegistrationLog
 
@@ -22,25 +23,39 @@ class RegistrationListSerializer(serializers.ModelSerializer):
     group_type = serializers.CharField(source='team.group_type', read_only=True)
     group_type_display = serializers.CharField(source='team.get_group_type_display', read_only=True)
     school_name = serializers.CharField(source='team.school.name', read_only=True)
+    school_county = serializers.CharField(source='team.school.county', read_only=True)
     city_id = serializers.IntegerField(source='team.school.city_id', read_only=True)
     city_name = serializers.CharField(source='team.school.city.name', read_only=True)
     status_display = serializers.CharField(source='get_status_display', read_only=True)
     reject_level_display = serializers.CharField(source='get_reject_level_display', read_only=True)
+    player_count = serializers.SerializerMethodField()
+    archived = serializers.SerializerMethodField()
 
     class Meta:
         model = Registration
         fields = (
             'id', 'competition', 'competition_name', 'competition_year', 'team', 'team_name',
-            'group_type', 'group_type_display', 'school_name', 'city_id', 'city_name',
+            'group_type', 'group_type_display', 'school_name', 'school_county', 'city_id', 'city_name',
             'status', 'status_display', 'reject_level', 'reject_level_display', 'reject_reason',
+            'player_count', 'archived', 'archived_at',
             'submitted_at', 'reported_at', 'created_at',
         )
+
+    def get_player_count(self, obj):
+        # 列表查询时由 queryset 注解注入，避免 N+1；详情等单对象场景回退到 count 查询
+        if hasattr(obj, 'player_count'):
+            return obj.player_count
+        return AthleteProfile.objects.filter(team=obj.team).count()
+
+    def get_archived(self, obj):
+        return bool(obj.archived_at)
 
 
 class PlayerMaterialSerializer(serializers.ModelSerializer):
     """报名详情中的球员信息（含学籍材料/头像状态）。"""
 
     user_id = serializers.IntegerField(source='user.id', read_only=True)
+    id_card = serializers.SerializerMethodField()
     has_enrollment_cert = serializers.SerializerMethodField()
     has_avatar = serializers.SerializerMethodField()
 
@@ -48,8 +63,12 @@ class PlayerMaterialSerializer(serializers.ModelSerializer):
         model = AthleteProfile
         fields = (
             'id', 'user_id', 'name', 'jersey_no', 'position', 'id_card',
-            'has_enrollment_cert', 'has_avatar', 'enrollment_cert_name', 'avatar_name', 'status',
+            'has_enrollment_cert', 'has_avatar', 'enrollment_cert_name', 'avatar_name',
+            'status', 'reject_reason',
         )
+
+    def get_id_card(self, obj):
+        return mask_id_card(obj.id_card)
 
     def get_has_enrollment_cert(self, obj):
         return bool(obj.enrollment_cert_path)
@@ -60,11 +79,16 @@ class PlayerMaterialSerializer(serializers.ModelSerializer):
 
 class CoachMaterialSerializer(serializers.ModelSerializer):
     user_id = serializers.IntegerField(source='user.id', read_only=True)
+    id_card = serializers.SerializerMethodField()
     has_qualification = serializers.SerializerMethodField()
 
     class Meta:
         model = CoachProfile
-        fields = ('id', 'user_id', 'name', 'phone', 'id_card', 'has_qualification', 'qualification_name', 'status')
+        fields = ('id', 'user_id', 'name', 'phone', 'id_card', 'has_qualification',
+                  'qualification_name', 'status', 'reject_reason')
+
+    def get_id_card(self, obj):
+        return mask_id_card(obj.id_card)
 
     def get_has_qualification(self, obj):
         return bool(obj.qualification_path)

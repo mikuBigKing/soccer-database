@@ -12,14 +12,16 @@
 
 身份信息与材料：
 - GET/PUT  /api/province/coaches(/<id>)                     教练员搜索/修改
+- POST /api/province/coaches/<id>/verify                    教练员实名认证审核
 - GET/PUT  /api/province/athletes(/<id>)                    球员搜索/修改
+- POST /api/province/athletes/<id>/verify                   球员实名认证审核
 - POST/GET /api/province/athletes/<id>/avatar               上传/查看球员头像
 - GET  /api/province/athletes/<id>/enrollment-cert/download 下载学籍验证材料
 - GET  /api/province/coaches/<id>/qualification/download    下载教练资质附件
 
 账号与日志：
 - GET/POST         /api/province/accounts                   报名账号查询/创建
-- PUT/DELETE       /api/province/accounts/<id>              报名账号修改/删除
+- PUT/DELETE       /api/province/accounts/<id>              报名账号修改/删除（含权限点下发，仅管理员）
 - GET              /api/province/logs                       报名日志查询
 """
 from urllib.parse import quote
@@ -31,7 +33,7 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, ProvinceProfile, UserRole
+from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, CountyProfile, ProfileStatus, ProvinceProfile, UserRole
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.pagination import paginated_response
@@ -59,8 +61,8 @@ User = get_user_model()
 
 ProvinceOnly = role_permission('province')
 
-# 报名账号管理的角色范围（与用户确认：市州端/省级端/管理员端账号）
-MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.PROVINCE, UserRole.ADMIN)
+# 报名账号管理的角色范围：市州/区县/省级/管理员账号
+MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.COUNTY, UserRole.PROVINCE, UserRole.ADMIN)
 
 
 # ---------------- 报名审核 ----------------
@@ -69,7 +71,10 @@ class ProvinceRegistrationListView(APIView):
     permission_classes = [ProvinceOnly]
 
     def get(self, request):
-        queryset = filter_registrations(Registration.objects.all(), request.query_params)
+        queryset = filter_registrations(
+            Registration.objects.annotate(player_count=Count('team__athletes', distinct=True)),
+            request.query_params,
+        )
         return Response(paginated_response(queryset, request, RegistrationListSerializer))
 
 
@@ -145,7 +150,7 @@ class ProvinceRegistrationExportView(APIView):
 
 
 class ProvinceStatisticsView(APIView):
-    """市州/高校报名统计。"""
+    """市州/高校报名统计 + 球队/球员维度汇总。"""
 
     permission_classes = [ProvinceOnly]
 
@@ -186,10 +191,54 @@ class ProvinceStatisticsView(APIView):
             .order_by('team__school_id'),
             ('team__school_id', 'team__school__name'),
         )
+
+        # 球队维度：每支参赛球队的报名状态
+        by_team = expand(
+            queryset.values(
+                'team_id', 'team__name', 'team__school__name',
+                'team__school__city__name', 'team__group_type',
+            )
+            .annotate(total=Count('id')).annotate(**status_annotations)
+            .order_by('team__school__city_id', 'team_id'),
+            ('team_id', 'team__name', 'team__school__name',
+             'team__school__city__name', 'team__group_type'),
+        )
+
+        # 球员维度：按市州统计球员总数与实名认证状态分布
+        athlete_qs = AthleteProfile.objects.all()
+        if competition_id:
+            athlete_qs = athlete_qs.filter(
+                team__registrations__competition_id=competition_id
+            ).distinct()
+        athlete_status_annotations = {
+            s: Count('id', filter=Q(status=s)) for s, _ in ProfileStatus.choices
+        }
+        athlete_by_city = (
+            athlete_qs.values('team__school__city_id', 'team__school__city__name')
+            .annotate(total=Count('id'))
+            .annotate(**athlete_status_annotations)
+            .order_by('team__school__city_id')
+        )
+        athlete_by_city_rows = []
+        for row in athlete_by_city:
+            athlete_by_city_rows.append({
+                'city_id': row['team__school__city_id'],
+                'city_name': row['team__school__city__name'],
+                'total': row['total'],
+                **{s: row.get(s, 0) for s, _ in ProfileStatus.choices},
+            })
+        athlete_overall = {
+            'total': athlete_qs.count(),
+            **{s: athlete_qs.filter(status=s).count() for s, _ in ProfileStatus.choices},
+        }
+
         return Response({
             'by_city': by_city,
             'by_group': by_group,
             'university_by_school': university_by_school,
+            'by_team': by_team,
+            'athlete_by_city': athlete_by_city_rows,
+            'athlete_overall': athlete_overall,
             'total': queryset.count(),
         })
 
@@ -210,16 +259,31 @@ class AthleteUpdateSerializer(serializers.Serializer):
     team_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
 
 
+class IdentityVerifySerializer(serializers.Serializer):
+    """实名认证审核：approve 通过（需已填身份证号），reject 驳回（必填原因）。"""
+
+    approve = serializers.BooleanField()
+    reason = serializers.CharField(max_length=500, required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs['approve'] and not attrs.get('reason'):
+            raise serializers.ValidationError({'reason': '驳回时必须填写原因'})
+        return attrs
+
+
 class ProvinceCoachListView(APIView):
     permission_classes = [ProvinceOnly]
 
     def get(self, request):
-        queryset = CoachProfile.objects.all().order_by('id')
+        queryset = CoachProfile.objects.select_related('user').all().order_by('id')
         keyword = request.query_params.get('keyword')
         if keyword:
             queryset = queryset.filter(
                 Q(name__icontains=keyword) | Q(phone__icontains=keyword) | Q(id_card__icontains=keyword)
             )
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
         return Response(paginated_response(queryset, request, CoachMaterialSerializer))
 
 
@@ -244,11 +308,44 @@ class ProvinceCoachDetailView(APIView):
         return Response(CoachMaterialSerializer(profile).data)
 
 
+class ProvinceCoachVerifyView(APIView):
+    """教练员实名认证审核：通过 / 驳回。"""
+
+    permission_classes = [ProvinceOnly]
+
+    def post(self, request, pk: int):
+        profile = CoachProfile.objects.filter(pk=pk).first()
+        if profile is None:
+            raise BusinessException(ResponseCode.NOT_FOUND, '教练不存在', status_code=404)
+        if profile.status != ProfileStatus.PENDING:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '仅待审核的实名认证可操作')
+        serializer = IdentityVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approve = serializer.validated_data['approve']
+
+        if approve:
+            if not profile.id_card:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '教练未填写身份证号，无法通过实名认证')
+            profile.status = ProfileStatus.APPROVED
+            profile.reject_reason = None
+            action = RegistrationLog.Action.IDENTITY_APPROVE
+            detail = {'target': 'coach', 'coach_id': profile.pk}
+        else:
+            profile.status = ProfileStatus.REJECTED
+            profile.reject_reason = serializer.validated_data['reason']
+            action = RegistrationLog.Action.IDENTITY_REJECT
+            detail = {'target': 'coach', 'coach_id': profile.pk, 'reason': serializer.validated_data['reason']}
+
+        profile.save(update_fields=['status', 'reject_reason', 'updated_at'])
+        write_log(action, request.user, None, detail)
+        return Response(CoachMaterialSerializer(profile).data)
+
+
 class ProvinceAthleteListView(APIView):
     permission_classes = [ProvinceOnly]
 
     def get(self, request):
-        queryset = AthleteProfile.objects.select_related('team').all().order_by('id')
+        queryset = AthleteProfile.objects.select_related('user', 'team').all().order_by('id')
         keyword = request.query_params.get('keyword')
         if keyword:
             queryset = queryset.filter(
@@ -257,6 +354,9 @@ class ProvinceAthleteListView(APIView):
         team_id = request.query_params.get('team_id')
         if team_id:
             queryset = queryset.filter(team_id=team_id)
+        status = request.query_params.get('status')
+        if status:
+            queryset = queryset.filter(status=status)
         return Response(paginated_response(queryset, request, PlayerMaterialSerializer))
 
 
@@ -278,6 +378,39 @@ class ProvinceAthleteDetailView(APIView):
             profile.save(update_fields=list(changed.keys()) + ['updated_at'])
             write_log(RegistrationLog.Action.IDENTITY_UPDATE, request.user, None,
                       {'target': 'athlete', 'athlete_id': profile.pk, 'changed': list(changed.keys())})
+        return Response(PlayerMaterialSerializer(profile).data)
+
+
+class ProvinceAthleteVerifyView(APIView):
+    """球员实名认证审核：通过 / 驳回。"""
+
+    permission_classes = [ProvinceOnly]
+
+    def post(self, request, pk: int):
+        profile = AthleteProfile.objects.filter(pk=pk).first()
+        if profile is None:
+            raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
+        if profile.status != ProfileStatus.PENDING:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '仅待审核的实名认证可操作')
+        serializer = IdentityVerifySerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        approve = serializer.validated_data['approve']
+
+        if approve:
+            if not profile.id_card:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '球员未填写身份证号，无法通过实名认证')
+            profile.status = ProfileStatus.APPROVED
+            profile.reject_reason = None
+            action = RegistrationLog.Action.IDENTITY_APPROVE
+            detail = {'target': 'athlete', 'athlete_id': profile.pk}
+        else:
+            profile.status = ProfileStatus.REJECTED
+            profile.reject_reason = serializer.validated_data['reason']
+            action = RegistrationLog.Action.IDENTITY_REJECT
+            detail = {'target': 'athlete', 'athlete_id': profile.pk, 'reason': serializer.validated_data['reason']}
+
+        profile.save(update_fields=['status', 'reject_reason', 'updated_at'])
+        write_log(action, request.user, None, detail)
         return Response(PlayerMaterialSerializer(profile).data)
 
 
@@ -328,24 +461,30 @@ class ProvinceCoachQualificationDownloadView(APIView):
         return material_download(profile.qualification_path, profile.qualification_name)
 
 
-# ---------------- 报名账号管理（市州/省级/管理员账号） ----------------
+# ---------------- 报名账号管理（市州/区县/省级/管理员账号） ----------------
 
 class AccountSerializer(serializers.ModelSerializer):
     role_display = serializers.CharField(source='get_role_display', read_only=True)
     city_id = serializers.SerializerMethodField()
     province_id = serializers.SerializerMethodField()
+    county = serializers.SerializerMethodField()
 
     class Meta:
         model = User
-        fields = ('id', 'name', 'phone', 'email', 'role', 'role_display', 'status', 'city_id', 'province_id', 'date_joined')
+        fields = ('id', 'name', 'phone', 'email', 'role', 'role_display', 'status',
+                  'city_id', 'province_id', 'county', 'date_joined')
 
     def get_city_id(self, obj):
-        profile = getattr(obj, 'city_profile', None)
+        profile = getattr(obj, 'city_profile', None) or getattr(obj, 'county_profile', None)
         return profile.city_id if profile else None
 
     def get_province_id(self, obj):
         profile = getattr(obj, 'province_profile', None)
         return profile.province_id if profile else None
+
+    def get_county(self, obj):
+        profile = getattr(obj, 'county_profile', None)
+        return profile.county if profile else None
 
 
 class AccountCreateSerializer(serializers.Serializer):
@@ -356,6 +495,7 @@ class AccountCreateSerializer(serializers.Serializer):
     email = serializers.EmailField(max_length=191, required=False, allow_blank=True)
     city_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     province_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    county = serializers.CharField(max_length=50, required=False, allow_blank=True)
 
     def validate(self, attrs):
         role = attrs['role']
@@ -366,9 +506,18 @@ class AccountCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({'email': '该邮箱已被使用'})
         else:
             if not attrs.get('phone'):
-                raise serializers.ValidationError({'phone': '市州/省级账号必须提供手机号'})
+                raise serializers.ValidationError({'phone': '市州/区县/省级账号必须提供手机号'})
             if User.objects.filter(phone=attrs['phone']).exists():
                 raise serializers.ValidationError({'phone': '该手机号已被注册'})
+        if role == UserRole.CITY and not attrs.get('city_id'):
+            raise serializers.ValidationError({'city_id': '市州账号必须选择所属市州'})
+        if role == UserRole.COUNTY:
+            if not attrs.get('city_id'):
+                raise serializers.ValidationError({'city_id': '区县账号必须选择所属市州'})
+            if not attrs.get('county'):
+                raise serializers.ValidationError({'county': '区县账号必须填写区县名称'})
+        if role == UserRole.PROVINCE and not attrs.get('province_id'):
+            raise serializers.ValidationError({'province_id': '省级账号必须选择所属省份'})
         return attrs
 
 
@@ -380,6 +529,10 @@ class AccountUpdateSerializer(serializers.Serializer):
     password = serializers.CharField(min_length=6, max_length=64, write_only=True, required=False)
     city_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     province_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
+    county = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    permissions = serializers.ListField(
+        child=serializers.CharField(max_length=100), required=False, allow_empty=True,
+    )
 
 
 def _get_managed_account(pk: int) -> User:
@@ -430,9 +583,13 @@ class ProvinceAccountListCreateView(APIView):
                     role=data['role'], password=data['password'],
                 )
             if data['role'] == UserRole.CITY:
-                CityProfile.objects.create(user=user, name=data['name'], city_id=data.get('city_id'))
+                CityProfile.objects.create(user=user, name=data['name'], city_id=data['city_id'])
+            elif data['role'] == UserRole.COUNTY:
+                CountyProfile.objects.create(
+                    user=user, name=data['name'], city_id=data['city_id'], county=data['county'],
+                )
             elif data['role'] == UserRole.PROVINCE:
-                ProvinceProfile.objects.create(user=user, name=data['name'], province_id=data.get('province_id'))
+                ProvinceProfile.objects.create(user=user, name=data['name'], province_id=data['province_id'])
 
         write_log(RegistrationLog.Action.ACCOUNT_CREATE, request.user, None,
                   {'target_user_id': user.pk, 'role': user.role})
@@ -465,11 +622,27 @@ class ProvinceAccountDetailView(APIView):
             profile.city_id = data['city_id']
             profile.save()
             changed.append('city_id')
+        if target.role == UserRole.COUNTY and ('city_id' in data or 'county' in data):
+            profile = getattr(target, 'county_profile', None) or CountyProfile(user=target, name=target.name)
+            if 'city_id' in data:
+                profile.city_id = data['city_id']
+                changed.append('city_id')
+            if 'county' in data:
+                profile.county = data['county']
+                changed.append('county')
+            profile.save()
         if 'province_id' in data and target.role == UserRole.PROVINCE:
             profile = getattr(target, 'province_profile', None) or ProvinceProfile(user=target, name=target.name)
             profile.province_id = data['province_id']
             profile.save()
             changed.append('province_id')
+
+        if 'permissions' in data:
+            if not is_admin(request.user):
+                raise BusinessException(ResponseCode.FORBIDDEN, '仅管理员可分配权限点')
+            target.permissions = data['permissions']
+            target.save(update_fields=['permissions'])
+            changed.append('permissions')
 
         if changed:
             write_log(RegistrationLog.Action.ACCOUNT_UPDATE, request.user, None,

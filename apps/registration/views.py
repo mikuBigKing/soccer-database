@@ -9,6 +9,7 @@
 - POST /api/registrations/<id>/athletes/<aid>/enrollment-cert   上传球员学籍验证材料
 - POST /api/registrations/<id>/coach-qualification              上传教练资质附件
 """
+from django.db.models import Count
 from rest_framework import serializers
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -58,7 +59,9 @@ class MyRegistrationListCreateView(APIView):
 
     def get(self, request):
         team_ids = _submitter_team_ids(request.user)
-        queryset = Registration.objects.filter(team_id__in=team_ids)
+        queryset = Registration.objects.filter(team_id__in=team_ids).annotate(
+            player_count=Count('team__athletes', distinct=True)
+        )
         queryset = filter_registrations(queryset, request.query_params)
         return Response(paginated_response(queryset, request, RegistrationListSerializer))
 
@@ -114,6 +117,8 @@ class EnrollmentCertUploadView(APIView):
         registration = _get_registration(pk)
         if registration.team_id not in _submitter_team_ids(request.user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本校/本队的报名单')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可上传资料')
         profile = AthleteProfile.objects.filter(pk=athlete_id, team=registration.team).first()
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '该球员不在此球队中', status_code=404)
@@ -141,6 +146,8 @@ class CoachQualificationUploadView(APIView):
         registration = _get_registration(pk)
         if registration.team_id not in _submitter_team_ids(request.user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本校/本队的报名单')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可上传资料')
         profile = CoachProfile.objects.filter(user=registration.team.coach).first()
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '该球队教练尚无档案', status_code=404)

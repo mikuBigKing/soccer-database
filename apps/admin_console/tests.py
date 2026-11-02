@@ -1,4 +1,6 @@
 """管理端球员 / 教练员 14 个接口测试（正常流 + 异常流）。"""
+from datetime import timedelta
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.hashers import check_password
@@ -9,13 +11,19 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, UserStatus
 from apps.admin_console.models import AdminOperationLog
+from apps.live.models import Match, MatchEvent
 from apps.org.models import City, GroupType, Province, School, Team, TeamStatus
+from apps.registration.models import Competition, Registration
 
 User = get_user_model()
 
 ID_CARD_1 = '11010519491231002X'
 ID_CARD_2 = '110101199003077758'
 ID_CARD_3 = '110101199003077766'
+# 阶段一新增球员用（校验位均正确）
+NEW_ID_CARD_1 = '110101198001010037'
+NEW_ID_CARD_2 = '110101198001010045'
+NEW_ID_CARD_3 = '110101198001010053'
 PASSWORD = 'Passw0rd!'
 
 
@@ -125,11 +133,17 @@ class PlayerListTest(BaseAdminData):
         self.assertEqual(body['data']['next_page'], 2)
 
     def test_item_fields(self):
-        item = self.admin_client.get('/api/admin/players').json()['data']['list'][0]
+        rows = self.admin_client.get('/api/admin/players').json()['data']['list']
+        item = [row for row in rows if row['id'] == self.p1.id][0]
         self.assertEqual(set(item), {
             'id', 'name', 'jersey_no', 'position', 'team_id', 'team_name',
-            'group_type', 'status', 'is_public', 'avatar', 'created_at',
+            'group_type', 'school_id', 'school_name', 'grade', 'height_cm', 'weight_kg',
+            'status', 'is_public', 'real_name_status', 'enrollment_status',
+            'eligibility_status', 'avatar', 'created_at', 'deleted_at',
         })
+        self.assertEqual(item['school_name'], '测试学校')
+        self.assertEqual(item['real_name_status'], 'unverified')
+        self.assertEqual(item['eligibility_status'], 'eligible')
 
     def test_filters(self):
         cases = [
@@ -180,6 +194,15 @@ class PlayerListTest(BaseAdminData):
         data = self.admin_client.get('/api/admin/players', {'id_card': ID_CARD_1}).json()['data']
         self.assertEqual(data['total'], 1)
 
+    def test_empty_result_beyond_range_falls_back_to_page_1(self):
+        data = self.admin_client.get(
+            '/api/admin/players', {'status': 'rejected', 'page': 99, 'page_size': 2},
+        ).json()['data']
+        self.assertEqual(data['total'], 0)
+        self.assertEqual(data['page'], 1)
+        self.assertEqual(data['list'], [])
+        self.assertIsNone(data['next_page'])
+
     def test_invalid_filter_value(self):
         resp = self.admin_client.get('/api/admin/players', {'status': 'nope'})
         self.assertEqual(resp.status_code, 400)
@@ -199,8 +222,10 @@ class PlayerDetailTest(BaseAdminData):
         data = resp.json()['data']
         self.assertEqual(set(data), {
             'id', 'name', 'jersey_no', 'position', 'team_id', 'team_name', 'group_type',
-            'status', 'is_public', 'avatar', 'created_at', 'id_card', 'phone',
-            'enrollment_cert', 'reject_reason', 'updated_at',
+            'school_id', 'school_name', 'grade', 'height_cm', 'weight_kg',
+            'status', 'is_public', 'real_name_status', 'enrollment_status',
+            'eligibility_status', 'avatar', 'created_at', 'deleted_at',
+            'id_card', 'phone', 'enrollment_cert', 'reject_reason', 'updated_at',
         })
         self.assertEqual(data['id_card'], '110***XXXX****002X')
         self.assertEqual(data['phone'], '138****0001')
@@ -400,6 +425,7 @@ class CoachListTest(BaseAdminData):
         self.assertEqual(item['phone'], '137****0001')
         self.assertEqual(set(item), {
             'id', 'name', 'phone', 'qualification', 'status', 'is_public', 'created_at',
+            'deleted_at',
         })
 
     def test_filters(self):
@@ -514,6 +540,16 @@ class CoachDeleteTest(BaseAdminData):
         self.assertEqual(resp.json()['code'], 40001)
         self.assertEqual(resp.json()['msg'], '该教练员有在执球队，不可删除')
 
+    def test_rejected_plus_pending_teams_still_blocks_delete(self):
+        # 驳回球队放行，但只要还有一支待审核/已通过球队就必须拦
+        Team.objects.create(
+            school=self.school, coach=self.coach_user, name='测试二队',
+            group_type=GroupType.MIDDLE_SCHOOL, status=TeamStatus.REJECTED,
+        )
+        resp = self.admin_client.delete(f'/api/admin/coaches/{self.c1.id}')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该教练员有在执球队，不可删除')
+
 
 class CoachPublishTest(BaseAdminData):
     def test_publish_rules(self):
@@ -528,10 +564,16 @@ class CoachPublishTest(BaseAdminData):
         self.assertEqual(resp.json()['msg'], '该教练员已公示')
 
     def test_unpublish_rules(self):
-        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/unpublish')
+        resp = self.admin_client.post(
+            f'/api/admin/coaches/{self.c3.id}/unpublish',
+            {'reason': '公示材料存在异议'}, format='json',
+        )
         self.assertEqual(resp.json()['code'], 0)
         self.assertEqual(resp.json()['data'], {'id': self.c3.id, 'is_public': False})
-        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/unpublish')
+        resp = self.admin_client.post(
+            f'/api/admin/coaches/{self.c3.id}/unpublish',
+            {'reason': '公示材料存在异议'}, format='json',
+        )
         self.assertEqual(resp.json()['msg'], '该教练员未公示')
 
     def test_missing_coach(self):
@@ -778,3 +820,478 @@ class DeletedAccountTest(BaseAdminData):
         self.assertEqual(log.target_type, 'player')
         self.assertEqual(log.target_id, self.p2.id)
         self.assertEqual(log.operator_id, self.admin.id)
+
+
+# ===========================================================================
+# 阶段一扩展测试：新增球员 / 档案字段 / 状态标记 / 批量与归档
+# ===========================================================================
+
+class PlayerCreateTest(BaseAdminData):
+    def test_create_creates_default_account_and_profile(self):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '新球员', 'phone': '13600000011', 'id_card': NEW_ID_CARD_1,
+            'school_id': self.school.id, 'grade': '初二', 'jersey_no': 11,
+            'height_cm': 175, 'weight_kg': 60,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertEqual(data['name'], '新球员')
+        self.assertEqual(data['status'], ProfileStatus.PENDING)
+        self.assertEqual(data['school_id'], self.school.id)
+        self.assertEqual(data['school_name'], '测试学校')
+        self.assertEqual(data['height_cm'], 175)
+        self.assertEqual(data['weight_kg'], 60)
+        self.assertEqual(data['real_name_status'], 'unverified')
+        self.assertEqual(data['eligibility_status'], 'eligible')
+
+        user = User.objects.get(phone='13600000011')
+        self.assertEqual(user.role, 'athlete')
+        self.assertEqual(user.username, '13600000011')
+        self.assertTrue(check_password(settings.DEFAULT_RESET_PASSWORD, user.password))
+        # 默认密码可登录
+        self.assertEqual(
+            login(APIClient(), '13600000011', settings.DEFAULT_RESET_PASSWORD).json()['code'], 0,
+        )
+
+        self.assertTrue(
+            AdminOperationLog.objects.filter(action='新增球员', target_id=data['id']).exists(),
+        )
+
+    def test_create_requires_name_phone_and_id_card(self):
+        cases = [
+            ({'phone': '13600000012', 'id_card': NEW_ID_CARD_2}, 'name'),
+            ({'name': '缺手机号', 'id_card': NEW_ID_CARD_2}, 'phone'),
+            ({'name': '缺身份证', 'phone': '13600000012'}, 'id_card'),
+        ]
+        for payload, field in cases:
+            with self.subTest(field=field):
+                resp = self.admin_client.post('/api/admin/players', payload, format='json')
+                self.assertEqual(resp.json()['code'], 10001)
+                self.assertIn(field, resp.json()['msg'])
+
+    def test_create_duplicate_phone_and_id_card(self):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '撞手机号', 'phone': '13800000001', 'id_card': NEW_ID_CARD_2,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertEqual(resp.json()['msg'], 'phone: 该手机号已被使用')
+
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '撞身份证', 'phone': '13600000012', 'id_card': ID_CARD_1,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertEqual(resp.json()['msg'], 'id_card: 该身份证号已被使用')
+
+    def test_create_school_and_id_card_validation(self):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '学校不存在', 'phone': '13600000013', 'id_card': NEW_ID_CARD_2,
+            'school_id': 999999,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertEqual(resp.json()['msg'], 'school_id: 学校不存在')
+
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '校验位错误', 'phone': '13600000014', 'id_card': '110101198001010030',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('id_card', resp.json()['msg'])
+
+
+class PlayerProfileFieldTest(BaseAdminData):
+    def test_update_profile_fields(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': self.school.id, 'grade': '高一', 'height_cm': 180, 'weight_kg': 70,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.school_id, self.school.id)
+        self.assertEqual(self.p2.grade, '高一')
+        self.assertEqual(self.p2.height_cm, 180)
+        self.assertEqual(self.p2.weight_kg, 70)
+        self.assertEqual(resp.json()['data']['school_name'], '测试学校')
+
+    def test_range_validation_and_clear_school(self):
+        for field in ('height_cm', 'weight_kg'):
+            with self.subTest(field=field):
+                resp = self.admin_client.put(
+                    f'/api/admin/players/{self.p2.id}', {field: 300}, format='json',
+                )
+                self.assertEqual(resp.json()['code'], 10001)
+                self.assertIn('取值范围 0–220', resp.json()['msg'])
+
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p2.id}', {'school_id': None}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertIsNone(self.p2.school_id)
+
+    def test_archived_list(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/players/{self.p2.id}').json()['code'], 0,
+        )
+        archived = self.admin_client.get('/api/admin/players', {'deleted': 'true'}).json()['data']
+        self.assertEqual([item['id'] for item in archived['list']], [self.p2.id])
+        self.assertIsNotNone(archived['list'][0]['deleted_at'])
+
+        normal = self.admin_client.get('/api/admin/players').json()['data']
+        self.assertNotIn(self.p2.id, [item['id'] for item in normal['list']])
+
+
+class PlayerStatusFlagsTest(BaseAdminData):
+    def test_update_flags_and_write_log(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/status-flags', {
+            'real_name_status': 'verified', 'enrollment_status': 'verified',
+            'eligibility_status': 'suspended',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['real_name_status'], 'verified')
+        self.assertEqual(resp.json()['data']['eligibility_status'], 'suspended')
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.eligibility_status, 'suspended')
+        self.assertTrue(
+            AdminOperationLog.objects.filter(action='修改球员状态', target_id=self.p1.id).exists(),
+        )
+
+    def test_disqualified_requires_reason(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/status-flags', {
+            'eligibility_status': 'disqualified',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('reason', resp.json()['msg'])
+
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/status-flags', {
+            'eligibility_status': 'disqualified', 'reason': '原因',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/status-flags', {
+            'eligibility_status': 'disqualified', 'reason': '因严重违纪取消参赛资格',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['eligibility_status'], 'disqualified')
+
+    def test_empty_and_invalid_payload(self):
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p1.id}/status-flags', {}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('至少传一个状态字段', resp.json()['msg'])
+
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/status-flags', {
+            'real_name_status': 'bad',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+
+class PlayerBatchAndRestoreTest(BaseAdminData):
+    def test_batch_reset_skips_missing_and_deleted(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/players/{self.p2.id}').json()['code'], 0,
+        )
+        resp = self.admin_client.post('/api/admin/players/batch-reset-password', {
+            'ids': [self.p1.id, self.p2.id, 999999],
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertEqual(data['total'], 3)
+        self.assertEqual(data['success'], 1)
+        self.assertEqual({item['id'] for item in data['skipped']}, {self.p2.id, 999999})
+        self.assertEqual(data['password'], settings.DEFAULT_RESET_PASSWORD)
+
+        self.p1_user.refresh_from_db()
+        self.assertTrue(check_password(settings.DEFAULT_RESET_PASSWORD, self.p1_user.password))
+
+    def test_batch_reset_custom_password_not_echoed(self):
+        resp = self.admin_client.post('/api/admin/players/batch-reset-password', {
+            'ids': [self.p1.id], 'password': 'aB345678',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertNotIn('password', resp.json()['data'])
+        self.assertEqual(login(APIClient(), '13800000001', 'aB345678').json()['code'], 0)
+
+    def test_batch_reset_rejects_weak_password_and_empty_ids(self):
+        resp = self.admin_client.post('/api/admin/players/batch-reset-password', {
+            'ids': [self.p1.id], 'password': '12345678',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('password', resp.json()['msg'])
+
+        resp = self.admin_client.post(
+            '/api/admin/players/batch-reset-password', {'ids': []}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_restore_reactivates_account(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/players/{self.p2.id}').json()['code'], 0,
+        )
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/restore')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.p2_user.refresh_from_db()
+        self.assertIsNone(self.p2.deleted_at)
+        self.assertEqual(self.p2_user.status, UserStatus.ACTIVE)
+        self.assertTrue(self.p2_user.is_active)
+        self.assertEqual(login(APIClient(), '13800000002').json()['code'], 0)
+
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/restore')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该球员未在归档中')
+
+    def test_restore_blocked_when_id_card_taken(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/players/{self.p2.id}').json()['code'], 0,
+        )
+        AthleteProfile.objects.filter(pk=self.p3.pk).update(id_card=ID_CARD_2)
+
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/restore')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '原身份证号已被其他在册球员占用，无法恢复')
+
+
+class PlayerDeleteRelationTest(BaseAdminData):
+    def _make_registration(self, status):
+        Team.objects.filter(pk=self.team.pk).update(status=TeamStatus.REJECTED)
+        competition = Competition.objects.create(name='测试赛事', year=2026)
+        return Registration.objects.create(
+            competition=competition, team=self.team, status=status,
+        )
+
+    def test_blocked_by_in_progress_registration(self):
+        self._make_registration(Registration.Status.SUBMITTED)
+        resp = self.admin_client.delete(f'/api/admin/players/{self.p1.id}')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '球员所在球队有进行中的报名，不可删除')
+
+    def test_draft_registration_allows_delete(self):
+        self._make_registration(Registration.Status.DRAFT)
+        resp = self.admin_client.delete(f'/api/admin/players/{self.p1.id}')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p1.refresh_from_db()
+        self.assertIsNotNone(self.p1.deleted_at)
+
+    def test_blocked_by_match_event(self):
+        Team.objects.filter(pk=self.team.pk).update(status=TeamStatus.REJECTED)
+        match = Match.objects.create(
+            group_type=GroupType.MIDDLE_SCHOOL, home_team_name='测试一队',
+            away_team_name='对手队', home_team=self.team, match_time=timezone.now(),
+        )
+        MatchEvent.objects.create(
+            match=match, type='goal', minute=10, athlete=self.p1, client_token='stage1-token',
+        )
+        resp = self.admin_client.delete(f'/api/admin/players/{self.p1.id}')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '球员有赛事记录，不可删除')
+
+
+class PlayerAccountStatusTest(BaseAdminData):
+    def test_disable_requires_reason_and_blocks_login(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p3.id}/account-status', {
+            'action': 'disable',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('reason', resp.json()['msg'])
+
+        player_client = auth_client(self.p3_user)
+        resp = self.admin_client.put(f'/api/admin/players/{self.p3.id}/account-status', {
+            'action': 'disable', 'reason': '账号存在异常需禁用',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertEqual(data['status'], UserStatus.DISABLED)
+        self.assertFalse(data['is_active'])
+        self.assertEqual(login(APIClient(), '13800000003').json()['code'], 20003)
+        self.assertEqual(player_client.get('/api/auth/me').status_code, 401)
+
+    def test_enable_restores_login(self):
+        self.admin_client.put(f'/api/admin/players/{self.p3.id}/account-status', {
+            'action': 'disable', 'reason': '账号存在异常需禁用',
+        }, format='json')
+        resp = self.admin_client.put(f'/api/admin/players/{self.p3.id}/account-status', {
+            'action': 'enable',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['status'], UserStatus.ACTIVE)
+        self.assertEqual(login(APIClient(), '13800000003').json()['code'], 0)
+
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p3.id}/account-status', {'action': 'bad'}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+
+
+class CoachWindowAndObjectionTest(BaseAdminData):
+    def test_invalid_window_rejected(self):
+        now = timezone.now()
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/publish', {
+            'start_at': (now + timedelta(hours=1)).isoformat(),
+            'end_at': now.isoformat(),
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertEqual(resp.json()['msg'], 'end_at: 公示结束时间必须晚于开始时间')
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/publish', {
+            'end_at': (now + timedelta(hours=1)).isoformat(),
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('start_at', resp.json()['msg'])
+
+    def test_window_persisted_and_expired_treated_unpublished(self):
+        now = timezone.now()
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/publish', {
+            'start_at': (now + timedelta(hours=1)).isoformat(),
+            'end_at': (now + timedelta(hours=2)).isoformat(),
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        detail = self.admin_client.get(f'/api/admin/coaches/{self.c1.id}').json()['data']
+        self.assertEqual(
+            detail['public_end_at'],
+            timezone.localtime(now + timedelta(hours=2)).strftime('%Y-%m-%d %H:%M:%S'),
+        )
+
+        # 先取消公示，再演示「过期公示视为未公示」
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/unpublish', {
+            'reason': '公示期设置错误需重设',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/publish', {
+            'start_at': (now - timedelta(hours=2)).isoformat(),
+            'end_at': (now - timedelta(hours=1)).isoformat(),
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        item = [row for row in self.admin_client.get('/api/admin/coaches').json()['data']['list']
+                if row['id'] == self.c1.id][0]
+        self.assertFalse(item['is_public'])
+
+        # 过期后允许再次设置新的公示期
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/publish', {
+            'start_at': now.isoformat(),
+            'end_at': (now + timedelta(hours=3)).isoformat(),
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+    def test_unpublish_reason_persisted(self):
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/unpublish', {
+            'reason': '公示材料存在异议',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        detail = self.admin_client.get(f'/api/admin/coaches/{self.c3.id}').json()['data']
+        self.assertEqual(detail['unpublish_reason'], '公示材料存在异议')
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/unpublish', {
+            'reason': '短',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/unpublish')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_objection_create_list_and_handle(self):
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/objections', {
+            'submitter_name': '王五', 'contact': '13600000010',
+            'content': '对公示结果有异议',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        obj = resp.json()['data']
+        self.assertEqual(obj['coach_id'], self.c1.id)
+        self.assertFalse(obj['handled'])
+
+        data = self.admin_client.get(f'/api/admin/coaches/{self.c1.id}/objections').json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(set(data['list'][0]), {
+            'id', 'coach_id', 'submitter_name', 'contact', 'content', 'handled', 'created_at',
+        })
+        data = self.admin_client.get(
+            f'/api/admin/coaches/{self.c1.id}/objections', {'handled': 'false'},
+        ).json()['data']
+        self.assertEqual(data['total'], 1)
+
+        resp = self.admin_client.put(f'/api/admin/objections/{obj["id"]}/handle', {
+            'note': '已电话核实',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertTrue(resp.json()['data']['handled'])
+        self.assertEqual(resp.json()['data']['note'], '已电话核实')
+        self.assertTrue(
+            AdminOperationLog.objects.filter(action='处理公示异议', target_id=self.c1.id).exists(),
+        )
+
+        resp = self.admin_client.put(f'/api/admin/objections/{obj["id"]}/handle', {}, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该异议已处理')
+
+        data = self.admin_client.get(
+            f'/api/admin/coaches/{self.c1.id}/objections', {'handled': 'true'},
+        ).json()['data']
+        self.assertEqual(data['total'], 1)
+
+    def test_objection_missing_and_required_fields(self):
+        resp = self.admin_client.post('/api/admin/coaches/999999/objections', {
+            'submitter_name': '王五', 'contact': '13600000010', 'content': '异议',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 30001)
+        self.assertEqual(resp.json()['msg'], '教练员不存在')
+
+        resp = self.admin_client.put('/api/admin/objections/999999/handle', {}, format='json')
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()['msg'], '异议不存在')
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c1.id}/objections', {
+            'submitter_name': '王五', 'contact': '13600000010',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('content', resp.json()['msg'])
+
+
+class CoachBatchAndRestoreTest(BaseAdminData):
+    def test_batch_reset_coach_password(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/coaches/{self.c3.id}').json()['code'], 0,
+        )
+        resp = self.admin_client.post('/api/admin/coaches/batch-reset-password', {
+            'ids': [self.c1.id, self.c2.id, self.c3.id],
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertEqual((data['total'], data['success']), (3, 2))
+        self.assertEqual(data['skipped'][0]['id'], self.c3.id)
+
+        self.coach_user.refresh_from_db()
+        self.assertTrue(check_password(settings.DEFAULT_RESET_PASSWORD, self.coach_user.password))
+
+    def test_restore_coach_reactivates_account(self):
+        self.assertEqual(
+            self.admin_client.delete(f'/api/admin/coaches/{self.c3.id}').json()['code'], 0,
+        )
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/restore')
+        self.assertEqual(resp.json()['code'], 0)
+        self.c3.refresh_from_db()
+        self.coach3_user.refresh_from_db()
+        self.assertIsNone(self.c3.deleted_at)
+        self.assertTrue(self.coach3_user.is_active)
+        self.assertEqual(login(APIClient(), '13700000003').json()['code'], 0)
+
+        resp = self.admin_client.post(f'/api/admin/coaches/{self.c3.id}/restore')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该教练员未在归档中')
+
+    def test_coach_delete_blocked_by_registration_and_match(self):
+        Team.objects.filter(pk=self.team.pk).update(status=TeamStatus.REJECTED)
+        competition = Competition.objects.create(name='教练赛事', year=2026)
+        Registration.objects.create(
+            competition=competition, team=self.team, status=Registration.Status.SUBMITTED,
+        )
+        resp = self.admin_client.delete(f'/api/admin/coaches/{self.c1.id}')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '教练所在球队有进行中的报名，不可删除')
+
+        Registration.objects.all().delete()
+        Match.objects.create(
+            group_type=GroupType.MIDDLE_SCHOOL, home_team_name='测试一队',
+            away_team_name='对手队', home_team=self.team, match_time=timezone.now(),
+        )
+        resp = self.admin_client.delete(f'/api/admin/coaches/{self.c1.id}')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '教练有赛事记录，不可删除')

@@ -11,17 +11,31 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, UserStatus
+from apps.accounts.models import (
+    AthleteProfile, CoachProfile, EligibilityStatus, ProfileStatus, UserRole, UserStatus,
+)
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.formatting import format_dt
 from apps.common.pagination import paginate
-from apps.org.models import Team, TeamStatus
+from apps.live.models import Match, MatchEvent
+from apps.org.models import School, Team, TeamStatus
+from apps.registration.models import Registration
 
 from .masking import mask_id_card, mask_phone
-from .models import AdminOperationLog
+from .models import AdminOperationLog, CoachObjection
 
 User = get_user_model()
+
+# 视为「在执 / 在队」的球队状态；rejected 视为历史球队，不阻塞删除
+ACTIVE_TEAM_STATUSES = (TeamStatus.PENDING, TeamStatus.APPROVED)
+# 报名进行中（草稿 / 已驳回不算），用于删除前关联校验
+IN_PROGRESS_REGISTRATION_STATUSES = (
+    Registration.Status.SUBMITTED,
+    Registration.Status.CITY_APPROVED,
+    Registration.Status.REPORTED,
+    Registration.Status.APPROVED,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -124,16 +138,67 @@ def _paginate(qs, request) -> dict:
     return data
 
 
+def _is_public_effective(is_public: bool, end_at) -> bool:
+    """公示是否「此刻生效」。
+
+    过期公示不靠定时任务，读取时惰性判断（is_public=True 但已过期 → 视为未公示）。
+    """
+    if not is_public:
+        return False
+    return end_at is None or end_at > timezone.now()
+
+
+def _school_of(profile):
+    """学校归属：档案直挂 school 优先，否则回落到球队学校。"""
+    if profile.school_id:
+        return profile.school
+    if profile.team_id and profile.team:
+        return profile.team.school
+    return None
+
+
+def _enable_user_account(user) -> None:
+    fields = []
+    if user.status != UserStatus.ACTIVE:
+        user.status = UserStatus.ACTIVE
+        fields.append('status')
+    if not user.is_active:
+        user.is_active = True
+        fields.append('is_active')
+    if fields:
+        user.save(update_fields=fields)
+
+
+def _ensure_phone_available(phone: str, exclude_user_id=None) -> None:
+    """手机号 / 登录名查重（新增球员用；修改走 `_sync_user_phone`）。"""
+    qs = User.objects.filter(phone=phone)
+    if exclude_user_id:
+        qs = qs.exclude(pk=exclude_user_id)
+    if qs.exists():
+        raise BusinessException(ResponseCode.PARAM_INVALID, 'phone: 该手机号已被使用')
+    if User.objects.filter(username=phone).exclude(pk=exclude_user_id or 0).exists():
+        raise BusinessException(ResponseCode.PARAM_INVALID, 'username: 该手机号已被占用')
+
+
+def _get_school(school_id):
+    school = School.objects.filter(pk=school_id).first()
+    if school is None:
+        raise BusinessException(ResponseCode.PARAM_INVALID, 'school_id: 学校不存在')
+    return school
+
+
 # ---------------------------------------------------------------------------
 # 球员
 # ---------------------------------------------------------------------------
 
-def _get_player(pk: int, for_update: bool = False) -> AthleteProfile:
-    qs = AthleteProfile.objects.select_related('user', 'team')
+def _get_player(pk: int, for_update: bool = False, with_deleted: bool = False) -> AthleteProfile:
+    qs = AthleteProfile.objects.select_related('user', 'team__school', 'school')
     if for_update:
         # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
         qs = qs.select_for_update()
     try:
+        if with_deleted:
+            return qs.get(pk=pk)
         return qs.get(pk=pk, deleted_at__isnull=True)
     except AthleteProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
@@ -141,6 +206,7 @@ def _get_player(pk: int, for_update: bool = False) -> AthleteProfile:
 
 def _player_list_item(profile: AthleteProfile) -> dict:
     team = profile.team if profile.team_id else None
+    school = _school_of(profile)
     return {
         'id': profile.id,
         'name': profile.name,
@@ -149,10 +215,19 @@ def _player_list_item(profile: AthleteProfile) -> dict:
         'team_id': profile.team_id,
         'team_name': team.name if team else None,
         'group_type': team.group_type if team else None,
+        'school_id': school.id if school else None,
+        'school_name': school.name if school else None,
+        'grade': profile.grade,
+        'height_cm': profile.height_cm,
+        'weight_kg': profile.weight_kg,
         'status': profile.status,
         'is_public': profile.is_public,
+        'real_name_status': profile.real_name_status,
+        'enrollment_status': profile.enrollment_status,
+        'eligibility_status': profile.eligibility_status,
         'avatar': profile.avatar_path,
         'created_at': format_dt(profile.created_at),
+        'deleted_at': format_dt(profile.deleted_at),
     }
 
 
@@ -169,9 +244,13 @@ def _player_detail(profile: AthleteProfile) -> dict:
 
 
 def list_players(request, params: dict) -> dict:
-    qs = (AthleteProfile.objects.filter(deleted_at__isnull=True)
-          .select_related('team')
+    qs = (AthleteProfile.objects
+          .select_related('team__school', 'school')
           .order_by('-created_at'))
+    if params.get('deleted'):
+        qs = qs.filter(deleted_at__isnull=False)
+    else:
+        qs = qs.filter(deleted_at__isnull=True)
 
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
@@ -205,6 +284,40 @@ def get_player(pk: int) -> dict:
 
 
 @transaction.atomic
+def create_player(request, data: dict) -> dict:
+    phone = data['phone']
+    id_card = data['id_card']
+    _ensure_phone_available(phone)
+    _ensure_id_card_available(id_card, AthleteProfile, None)
+
+    school = _get_school(data['school_id']) if data.get('school_id') else None
+    user = User.objects.create_user(
+        username=phone,
+        phone=phone,
+        role=UserRole.ATHLETE,
+        name=data['name'],
+        password=settings.DEFAULT_RESET_PASSWORD,
+    )
+    profile = AthleteProfile.objects.create(
+        user=user,
+        name=data['name'],
+        id_card=id_card,
+        school=school,
+        grade=data.get('grade') or None,
+        position=data.get('position') or None,
+        jersey_no=data.get('jersey_no'),
+        height_cm=data.get('height_cm'),
+        weight_kg=data.get('weight_kg'),
+        status=ProfileStatus.PENDING,
+    )
+    # 新建档案默认待审核，后续走审核 / 状态标记接口
+
+    after = _player_detail(profile)
+    _log(request, '新增球员', 'player', profile.id, None, after)
+    return after
+
+
+@transaction.atomic
 def update_player(request, pk: int, data: dict) -> dict:
     player = _get_player(pk)
     before = _player_detail(player)
@@ -216,9 +329,16 @@ def update_player(request, pk: int, data: dict) -> dict:
         'position': 'position',
         'avatar': 'avatar_path',
         'id_card': 'id_card',
+        'grade': 'grade',
+        'height_cm': 'height_cm',
+        'weight_kg': 'weight_kg',
     }
     if data.get('id_card'):
         _ensure_id_card_available(data['id_card'], AthleteProfile, player.pk)
+    if 'school_id' in data:
+        school_id = data['school_id']
+        player.school = _get_school(school_id) if school_id else None
+        changed.append('school')
     for source, target in field_map.items():
         if source in data:
             setattr(player, target, data[source])
@@ -244,12 +364,45 @@ def update_player(request, pk: int, data: dict) -> dict:
 
 
 @transaction.atomic
+def update_player_status_flags(request, pk: int, data: dict) -> dict:
+    """状态标记（实名 / 学籍 / 参赛资格）。
+
+    说明：eligibility_status 改 suspended 时不生成停赛记录（停赛记录在阶段二打通）。
+    """
+    player = _get_player(pk)
+    before = _player_detail(player)
+
+    changed = []
+    for field in ('real_name_status', 'enrollment_status', 'eligibility_status'):
+        if field in data:
+            setattr(player, field, data[field])
+            changed.append(field)
+    if not changed:
+        return before
+
+    player.updated_at = timezone.now()
+    player.save(update_fields=changed + ['updated_at'])
+
+    after = _player_detail(player)
+    reason = (data.get('reason') or '').strip()
+    if reason:
+        after['reason'] = reason  # 留痕：取消资格等必须写原因
+    _log(request, '修改球员状态', 'player', player.id, before, after)
+    return after
+
+
+@transaction.atomic
 def delete_player(request, pk: int) -> dict:
     player = _get_player(pk, for_update=True)
     # 只拦「待审核 / 已通过」的球队；球队已驳回时球员可删除
-    if (player.team_id
-            and player.team.status in (TeamStatus.PENDING, TeamStatus.APPROVED)):
+    if player.team_id and player.team.status in ACTIVE_TEAM_STATUSES:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员已加入球队，不可删除')
+    if player.team_id and Registration.objects.filter(
+        team=player.team, status__in=IN_PROGRESS_REGISTRATION_STATUSES,
+    ).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '球员所在球队有进行中的报名，不可删除')
+    if MatchEvent.objects.filter(athlete=player).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '球员有赛事记录，不可删除')
 
     before = _player_detail(player)
     now = timezone.now()
@@ -300,26 +453,101 @@ def unpublish_player(request, pk: int) -> dict:
     return {'id': player.id, 'is_public': False}
 
 
+def _reset_password_value(data) -> str:
+    """自定义密码走序列化器策略校验；未传则用默认密码。"""
+    return (data or {}).get('password') or settings.DEFAULT_RESET_PASSWORD
+
+
 @transaction.atomic
-def reset_player_password(request, pk: int) -> dict:
+def reset_player_password(request, pk: int, data=None) -> dict:
     player = _get_player(pk)
-    player.user.set_password(settings.DEFAULT_RESET_PASSWORD)
+    password = _reset_password_value(data)
+    player.user.set_password(password)
     player.user.save(update_fields=['password'])
 
     _log(request, '重置球员密码', 'player', player.id, None, None)
     return {'id': player.id, 'reset': True}
 
 
+@transaction.atomic
+def batch_reset_player_password(request, data: dict) -> dict:
+    """批量重置：逐条独立处理，已删除 / 不存在跳过；整体只写一条审计日志。"""
+    ids = data['ids']
+    custom_password = bool(data.get('password'))
+    password = _reset_password_value(data)
+    success = 0
+    skipped = []
+    for player_id in ids:
+        player = (AthleteProfile.objects.filter(pk=player_id, deleted_at__isnull=True)
+                  .select_related('user').first())
+        if player is None:
+            skipped.append({'id': player_id, 'reason': '球员不存在或已删除'})
+            continue
+        player.user.set_password(password)
+        player.user.save(update_fields=['password'])
+        success += 1
+
+    result = {'total': len(ids), 'success': success, 'skipped': skipped}
+    if not custom_password:
+        # 仅默认密码回显，自定义密码不回显
+        result['password'] = settings.DEFAULT_RESET_PASSWORD
+    _log(request, '批量重置球员密码', 'player', 0, {'ids': ids}, result)
+    return result
+
+
+@transaction.atomic
+def restore_player(request, pk: int) -> dict:
+    player = _get_player(pk, with_deleted=True)
+    if player.deleted_at is None:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员未在归档中')
+
+    phone = player.user.phone
+    if phone and User.objects.filter(phone=phone).exclude(pk=player.user_id).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '原手机号已被其他账号占用，无法恢复')
+    if player.id_card and AthleteProfile.objects.filter(
+        id_card=player.id_card, deleted_at__isnull=True,
+    ).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '原身份证号已被其他在册球员占用，无法恢复')
+
+    before = _player_detail(player)
+    player.deleted_at = None
+    player.updated_at = timezone.now()
+    player.save(update_fields=['deleted_at', 'updated_at'])
+    _enable_user_account(player.user)
+
+    after = _player_detail(player)
+    _log(request, '恢复球员', 'player', player.id, before, after)
+    return after
+
+
+@transaction.atomic
+def update_player_account_status(request, pk: int, data: dict) -> dict:
+    player = _get_player(pk)
+    user = player.user
+    before = {'status': user.status, 'is_active': user.is_active}
+
+    if data['action'] == 'enable':
+        _enable_user_account(user)
+    else:
+        _disable_user_account(user)
+
+    after = {'status': user.status, 'is_active': user.is_active}
+    _log(request, '修改球员账号状态', 'player', player.id, before, after)
+    return {'id': player.id, **after}
+
+
 # ---------------------------------------------------------------------------
 # 教练员
 # ---------------------------------------------------------------------------
 
-def _get_coach(pk: int, for_update: bool = False) -> CoachProfile:
+def _get_coach(pk: int, for_update: bool = False, with_deleted: bool = False) -> CoachProfile:
     qs = CoachProfile.objects.select_related('user')
     if for_update:
         # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
         qs = qs.select_for_update()
     try:
+        if with_deleted:
+            return qs.get(pk=pk)
         return qs.get(pk=pk, deleted_at__isnull=True)
     except CoachProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '教练员不存在', status_code=404)
@@ -332,8 +560,10 @@ def _coach_list_item(profile: CoachProfile) -> dict:
         'phone': mask_phone(profile.phone or ''),
         'qualification': profile.qualification_path,
         'status': profile.status,
-        'is_public': profile.is_public,
+        # 过期公示惰性判定为未公示
+        'is_public': _is_public_effective(profile.is_public, profile.public_end_at),
         'created_at': format_dt(profile.created_at),
+        'deleted_at': format_dt(profile.deleted_at),
     }
 
 
@@ -346,6 +576,9 @@ def _coach_detail(profile: CoachProfile) -> dict:
             {'id': team.id, 'name': team.name, 'group_type': team.group_type}
             for team in teams
         ],
+        'public_start_at': format_dt(profile.public_start_at),
+        'public_end_at': format_dt(profile.public_end_at),
+        'unpublish_reason': profile.unpublish_reason,
         'reject_reason': profile.reject_reason,
         'updated_at': format_dt(profile.updated_at),
     })
@@ -353,8 +586,11 @@ def _coach_detail(profile: CoachProfile) -> dict:
 
 
 def list_coaches(request, params: dict) -> dict:
-    qs = (CoachProfile.objects.filter(deleted_at__isnull=True)
-          .order_by('-created_at'))
+    qs = CoachProfile.objects.order_by('-created_at')
+    if params.get('deleted'):
+        qs = qs.filter(deleted_at__isnull=False)
+    else:
+        qs = qs.filter(deleted_at__isnull=True)
 
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
@@ -428,11 +664,18 @@ def update_coach(request, pk: int, data: dict) -> dict:
 def delete_coach(request, pk: int) -> dict:
     coach = _get_coach(pk, for_update=True)
     # 只拦「待审核 / 已通过」的球队；球队已驳回时教练可删除
-    if Team.objects.filter(
-        coach=coach.user,
-        status__in=[TeamStatus.PENDING, TeamStatus.APPROVED],
-    ).exists():
+    active_teams = Team.objects.filter(coach=coach.user, status__in=ACTIVE_TEAM_STATUSES)
+    if active_teams.exists():
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员有在执球队，不可删除')
+    coach_teams = Team.objects.filter(coach=coach.user)
+    if Registration.objects.filter(
+        team__in=coach_teams, status__in=IN_PROGRESS_REGISTRATION_STATUSES,
+    ).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '教练所在球队有进行中的报名，不可删除')
+    if Match.objects.filter(
+        Q(home_team__in=coach_teams) | Q(away_team__in=coach_teams),
+    ).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '教练有赛事记录，不可删除')
 
     before = _coach_detail(coach)
     now = timezone.now()
@@ -452,42 +695,173 @@ def delete_coach(request, pk: int) -> dict:
 
 
 @transaction.atomic
-def publish_coach(request, pk: int) -> dict:
+def publish_coach(request, pk: int, data=None) -> dict:
     coach = _get_coach(pk, for_update=True)
     if coach.status != ProfileStatus.APPROVED:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅审核通过的教练员可公示')
-    if coach.is_public:
+    # 已过期公示视为未公示，允许重新设置公示期
+    if _is_public_effective(coach.is_public, coach.public_end_at):
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员已公示')
 
     before = _coach_detail(coach)
     coach.is_public = True
+    coach.public_start_at = (data or {}).get('start_at')
+    coach.public_end_at = (data or {}).get('end_at')
+    coach.unpublish_reason = None
     coach.updated_at = timezone.now()
-    coach.save(update_fields=['is_public', 'updated_at'])
+    coach.save(update_fields=[
+        'is_public', 'public_start_at', 'public_end_at', 'unpublish_reason', 'updated_at',
+    ])
 
     _log(request, '公示教练员', 'coach', coach.id, before, _coach_detail(coach))
     return {'id': coach.id, 'is_public': True}
 
 
 @transaction.atomic
-def unpublish_coach(request, pk: int) -> dict:
+def unpublish_coach(request, pk: int, data: dict) -> dict:
     coach = _get_coach(pk, for_update=True)
-    if not coach.is_public:
+    if not _is_public_effective(coach.is_public, coach.public_end_at):
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员未公示')
+    reason = data['reason'].strip()
 
     before = _coach_detail(coach)
     coach.is_public = False
+    coach.unpublish_reason = reason
     coach.updated_at = timezone.now()
-    coach.save(update_fields=['is_public', 'updated_at'])
+    coach.save(update_fields=['is_public', 'unpublish_reason', 'updated_at'])
 
-    _log(request, '取消公示教练员', 'coach', coach.id, before, _coach_detail(coach))
+    after = _coach_detail(coach)
+    after['reason'] = reason  # 取消公示原因留痕
+    _log(request, '取消公示教练员', 'coach', coach.id, before, after)
     return {'id': coach.id, 'is_public': False}
 
 
 @transaction.atomic
-def reset_coach_password(request, pk: int) -> dict:
+def reset_coach_password(request, pk: int, data=None) -> dict:
     coach = _get_coach(pk)
-    coach.user.set_password(settings.DEFAULT_RESET_PASSWORD)
+    password = _reset_password_value(data)
+    coach.user.set_password(password)
     coach.user.save(update_fields=['password'])
 
     _log(request, '重置教练员密码', 'coach', coach.id, None, None)
     return {'id': coach.id, 'reset': True}
+
+
+@transaction.atomic
+def batch_reset_coach_password(request, data: dict) -> dict:
+    """批量重置：逐条独立处理，已删除 / 不存在跳过；整体只写一条审计日志。"""
+    ids = data['ids']
+    custom_password = bool(data.get('password'))
+    password = _reset_password_value(data)
+    success = 0
+    skipped = []
+    for coach_id in ids:
+        coach = (CoachProfile.objects.filter(pk=coach_id, deleted_at__isnull=True)
+                 .select_related('user').first())
+        if coach is None:
+            skipped.append({'id': coach_id, 'reason': '教练员不存在或已删除'})
+            continue
+        coach.user.set_password(password)
+        coach.user.save(update_fields=['password'])
+        success += 1
+
+    result = {'total': len(ids), 'success': success, 'skipped': skipped}
+    if not custom_password:
+        result['password'] = settings.DEFAULT_RESET_PASSWORD
+    _log(request, '批量重置教练员密码', 'coach', 0, {'ids': ids}, result)
+    return result
+
+
+@transaction.atomic
+def restore_coach(request, pk: int) -> dict:
+    coach = _get_coach(pk, with_deleted=True)
+    if coach.deleted_at is None:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员未在归档中')
+
+    phone = coach.user.phone
+    if phone and User.objects.filter(phone=phone).exclude(pk=coach.user_id).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '原手机号已被其他账号占用，无法恢复')
+    if coach.id_card and CoachProfile.objects.filter(
+        id_card=coach.id_card, deleted_at__isnull=True,
+    ).exists():
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '原身份证号已被其他在册教练占用，无法恢复')
+
+    before = _coach_detail(coach)
+    coach.deleted_at = None
+    coach.updated_at = timezone.now()
+    coach.save(update_fields=['deleted_at', 'updated_at'])
+    _enable_user_account(coach.user)
+
+    after = _coach_detail(coach)
+    _log(request, '恢复教练员', 'coach', coach.id, before, after)
+    return after
+
+
+@transaction.atomic
+def update_coach_account_status(request, pk: int, data: dict) -> dict:
+    coach = _get_coach(pk)
+    user = coach.user
+    before = {'status': user.status, 'is_active': user.is_active}
+
+    if data['action'] == 'enable':
+        _enable_user_account(user)
+    else:
+        _disable_user_account(user)
+
+    after = {'status': user.status, 'is_active': user.is_active}
+    _log(request, '修改教练员账号状态', 'coach', coach.id, before, after)
+    return {'id': coach.id, **after}
+
+
+# ---------------------------------------------------------------------------
+# 公示期异议
+# ---------------------------------------------------------------------------
+
+def _objection_item(obj: CoachObjection) -> dict:
+    return {
+        'id': obj.id,
+        'coach_id': obj.coach_id,
+        'submitter_name': obj.submitter_name,
+        'contact': obj.contact,
+        'content': obj.content,
+        'handled': obj.handled,
+        'created_at': format_dt(obj.created_at),
+    }
+
+
+@transaction.atomic
+def create_objection(request, coach_id: int, data: dict) -> dict:
+    coach = _get_coach(coach_id)
+    obj = CoachObjection.objects.create(coach=coach, **data)
+    _log(request, '代录公示异议', 'coach', coach.id, None, _objection_item(obj))
+    return _objection_item(obj)
+
+
+def list_objections(request, coach_id: int, params: dict) -> dict:
+    coach = _get_coach(coach_id)
+    qs = CoachObjection.objects.filter(coach=coach).order_by('-id')
+    if 'handled' in params:
+        qs = qs.filter(handled=params['handled'])
+    data = _paginate(qs, request)
+    data['list'] = [_objection_item(obj) for obj in data['list']]
+    return data
+
+
+@transaction.atomic
+def handle_objection(request, pk: int, data: dict) -> dict:
+    obj = CoachObjection.objects.select_related('coach').filter(pk=pk).first()
+    if obj is None:
+        raise BusinessException(ResponseCode.NOT_FOUND, '异议不存在', status_code=404)
+    if obj.handled:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '该异议已处理')
+
+    before = _objection_item(obj)
+    obj.handled = True
+    obj.save(update_fields=['handled'])
+
+    after = _objection_item(obj)
+    note = (data.get('note') or '').strip()
+    if note:
+        after['note'] = note
+    _log(request, '处理公示异议', 'coach', obj.coach_id, before, after)
+    return after

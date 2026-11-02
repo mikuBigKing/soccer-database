@@ -21,3 +21,22 @@ class AdminOperationLog(models.Model):
         db_table = 'admin_operation_logs'
         ordering = ('-id',)
         indexes = [models.Index(fields=['target_type', 'target_id'], name='idx_admin_op_target')]
+
+
+class CoachObjection(models.Model):
+    """教练公示期异议（管理员代录）。"""
+
+    coach = models.ForeignKey(
+        'accounts.CoachProfile', on_delete=models.CASCADE,
+        related_name='objections', verbose_name='教练员',
+    )
+    submitter_name = models.CharField('提交人', max_length=50)
+    contact = models.CharField('联系方式', max_length=50)
+    content = models.TextField('异议内容')
+    handled = models.BooleanField('已处理', default=False, db_index=True)
+    created_at = models.DateTimeField('提交时间', auto_now_add=True)
+
+    class Meta:
+        db_table = 'coach_objections'
+        ordering = ('-id',)
+        indexes = [models.Index(fields=['coach', 'handled'])]

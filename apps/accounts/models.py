@@ -35,6 +35,11 @@ class VerifyStatus(models.TextChoices):
     FAILED = 'failed', '验证不通过'
 
 
+class Gender(models.TextChoices):
+    MALE = 'male', '男'
+    FEMALE = 'female', '女'
+
+
 class EligibilityStatus(models.TextChoices):
     ELIGIBLE = 'eligible', '可参赛'
     SUSPENDED = 'suspended', '停赛中'
@@ -175,6 +180,9 @@ class AthleteProfile(models.Model):
     deleted_at = models.DateTimeField('软删除时间', null=True, blank=True)
     school = models.ForeignKey(
         'org.School', null=True, blank=True, on_delete=models.SET_NULL, related_name='athletes_direct',
+    )
+    gender = models.CharField(
+        '性别', max_length=10, choices=Gender.choices, null=True, blank=True,
     )
     grade = models.CharField('年级', max_length=20, null=True, blank=True)
     height_cm = models.PositiveSmallIntegerField('身高(cm)', null=True, blank=True)

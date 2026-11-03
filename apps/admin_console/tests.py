@@ -1,5 +1,6 @@
 """管理端球员 / 教练员 14 个接口测试（正常流 + 异常流）。"""
 from datetime import timedelta
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -10,7 +11,9 @@ from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
 
 from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, UserStatus
-from apps.admin_console.models import AdminOperationLog
+from apps.admin_console.models import (
+    AdminOperationLog, PlayerSuspension, PlayerTeamChange,
+)
 from apps.live.models import Match, MatchEvent
 from apps.org.models import City, GroupType, Province, School, Team, TeamStatus
 from apps.registration.models import Competition, Registration
@@ -136,7 +139,7 @@ class PlayerListTest(BaseAdminData):
         rows = self.admin_client.get('/api/admin/players').json()['data']['list']
         item = [row for row in rows if row['id'] == self.p1.id][0]
         self.assertEqual(set(item), {
-            'id', 'name', 'jersey_no', 'position', 'team_id', 'team_name',
+            'id', 'name', 'gender', 'jersey_no', 'position', 'team_id', 'team_name',
             'group_type', 'school_id', 'school_name', 'grade', 'height_cm', 'weight_kg',
             'status', 'is_public', 'real_name_status', 'enrollment_status',
             'eligibility_status', 'avatar', 'created_at', 'deleted_at',
@@ -221,11 +224,11 @@ class PlayerDetailTest(BaseAdminData):
         self.assertEqual(resp.json()['code'], 0)
         data = resp.json()['data']
         self.assertEqual(set(data), {
-            'id', 'name', 'jersey_no', 'position', 'team_id', 'team_name', 'group_type',
+            'id', 'name', 'gender', 'jersey_no', 'position', 'team_id', 'team_name', 'group_type',
             'school_id', 'school_name', 'grade', 'height_cm', 'weight_kg',
             'status', 'is_public', 'real_name_status', 'enrollment_status',
             'eligibility_status', 'avatar', 'created_at', 'deleted_at',
-            'id_card', 'phone', 'enrollment_cert', 'reject_reason', 'updated_at',
+            'id_card', 'phone', 'enrollment_cert', 'reject_reason', 'suspensions', 'updated_at',
         })
         self.assertEqual(data['id_card'], '110***XXXX****002X')
         self.assertEqual(data['phone'], '138****0001')
@@ -897,6 +900,41 @@ class PlayerCreateTest(BaseAdminData):
         self.assertIn('id_card', resp.json()['msg'])
 
 
+class PlayerGenderTest(BaseAdminData):
+    def test_create_with_gender_persisted(self):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '女球员', 'phone': '13600000015', 'id_card': NEW_ID_CARD_3,
+            'gender': 'female',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['gender'], 'female')
+        new_player = AthleteProfile.objects.get(pk=resp.json()['data']['id'])
+        self.assertEqual(new_player.gender, 'female')
+
+    def test_update_gender_and_invalid_choice(self):
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p2.id}', {'gender': 'male'}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.gender, 'male')
+
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p2.id}', {'gender': 'other'}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('gender', resp.json()['msg'])
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.gender, 'male')
+
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '非法性别', 'phone': '13600000016', 'id_card': NEW_ID_CARD_3,
+            'gender': 'other',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('gender', resp.json()['msg'])
+
+
 class PlayerProfileFieldTest(BaseAdminData):
     def test_update_profile_fields(self):
         resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}', {
@@ -1295,3 +1333,616 @@ class CoachBatchAndRestoreTest(BaseAdminData):
         resp = self.admin_client.delete(f'/api/admin/coaches/{self.c1.id}')
         self.assertEqual(resp.json()['code'], 40001)
         self.assertEqual(resp.json()['msg'], '教练有赛事记录，不可删除')
+
+
+# ===========================================================================
+# 阶段二扩展测试：停赛联动 / 归属变更 / 合并球员
+# ===========================================================================
+
+def add_card_events(player, yellow=0, red=0):
+    """给球员造红黄牌事件（同场赛事，client_token 唯一）。"""
+    match = Match.objects.create(
+        group_type=GroupType.MIDDLE_SCHOOL, home_team_name='测试一队',
+        away_team_name='对手队', match_time=timezone.now(),
+    )
+    events = []
+    for kind, count in (('yellow', yellow), ('red', red)):
+        for index in range(count):
+            events.append(MatchEvent.objects.create(
+                match=match, type=kind, minute=index + 1, athlete=player,
+                client_token=uuid4().hex,
+            ))
+    return events
+
+
+class SuspensionTest(BaseAdminData):
+    def test_preview_yellow_threshold(self):
+        add_card_events(self.p3, yellow=4)
+        resp = self.admin_client.get(f'/api/admin/players/{self.p3.id}/suspension-preview')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertEqual(set(data), {
+            'yellow_total', 'red_total', 'yellow_since_last_ban', 'will_suspend', 'rule',
+        })
+        self.assertEqual(data['yellow_total'], 4)
+        self.assertEqual(data['yellow_since_last_ban'], 4)
+        self.assertTrue(data['will_suspend'])
+        self.assertEqual(data['rule'], {
+            'yellow_threshold': 4, 'yellow_ban_matches': 1, 'red_ban_matches': 2,
+        })
+
+    def test_preview_below_threshold(self):
+        add_card_events(self.p3, yellow=3)
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p3.id}/suspension-preview',
+        ).json()['data']
+        self.assertEqual(data['yellow_since_last_ban'], 3)
+        self.assertFalse(data['will_suspend'])
+
+    def test_generate_yellow_and_idempotent(self):
+        add_card_events(self.p3, yellow=4)
+        resp = self.admin_client.post(f'/api/admin/players/{self.p3.id}/suspensions/generate')
+        self.assertEqual(resp.json()['code'], 0)
+        created = resp.json()['data']['created']
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0]['source'], PlayerSuspension.Source.AUTO)
+        self.assertEqual(created[0]['matches_count'], 1)
+        self.assertEqual(created[0]['status'], PlayerSuspension.Status.ACTIVE)
+        self.assertEqual(len(created[0]['source_events']), 4)
+
+        self.p3.refresh_from_db()
+        self.assertEqual(self.p3.eligibility_status, 'suspended')
+        detail = self.admin_client.get(f'/api/admin/players/{self.p3.id}').json()['data']
+        self.assertEqual(detail['suspensions']['active_count'], 1)
+        self.assertIsNotNone(detail['suspensions']['latest'])
+
+        # 幂等：已计入的事件不重复生成
+        resp = self.admin_client.post(f'/api/admin/players/{self.p3.id}/suspensions/generate')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '未达到停赛条件')
+        self.assertEqual(PlayerSuspension.objects.filter(player=self.p3).count(), 1)
+
+    def test_generate_red_card_two_matches(self):
+        add_card_events(self.p3, red=1)
+        resp = self.admin_client.post(f'/api/admin/players/{self.p3.id}/suspensions/generate')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['created'][0]['matches_count'], 2)
+
+    def test_generate_without_cards_rejected(self):
+        resp = self.admin_client.post(f'/api/admin/players/{self.p3.id}/suspensions/generate')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '未达到停赛条件')
+
+    def test_manual_suspend_and_revoke(self):
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '暴力犯规追加停赛', 'matches_count': 3,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        record = resp.json()['data']
+        self.assertEqual(record['source'], PlayerSuspension.Source.MANUAL)
+        self.assertEqual(record['status'], PlayerSuspension.Status.ACTIVE)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'suspended')
+
+        resp = self.admin_client.put(f'/api/admin/suspensions/{record["id"]}/revoke', {
+            'reason': '申诉成功撤销停赛',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['status'], PlayerSuspension.Status.REVOKED)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'eligible')
+
+        resp = self.admin_client.put(f'/api/admin/suspensions/{record["id"]}/revoke', {
+            'reason': '重复撤销',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该停赛记录已结束')
+
+        resp = self.admin_client.put('/api/admin/suspensions/999999/revoke', {
+            'reason': '不存在',
+        }, format='json')
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()['msg'], '停赛记录不存在')
+
+    def test_manual_requires_reason_and_matches(self):
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '停赛',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('matches_count', resp.json()['msg'])
+
+        resp = self.admin_client.put('/api/admin/suspensions/1/revoke', {}, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('reason', resp.json()['msg'])
+
+
+class PlayerTeamTest(BaseAdminData):
+    def test_bind_team_writes_change(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}/team', {
+            'team_id': self.team.id, 'reason': '首次绑定球队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertIsNone(resp.json()['data']['from_team_id'])
+        self.assertEqual(resp.json()['data']['to_team_id'], self.team.id)
+
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.team_id, self.team.id)
+        change = PlayerTeamChange.objects.get(player=self.p2)
+        self.assertEqual(change.to_team_id, self.team.id)
+        self.assertEqual(change.reason, '首次绑定球队')
+        self.assertEqual(change.changed_by, self.admin.id)
+
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/team-changes',
+        ).json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(set(data['list'][0]), {
+            'id', 'player_id', 'from_team_id', 'from_team_name', 'to_team_id',
+            'to_team_name', 'reason', 'changed_by', 'created_at',
+        })
+
+    def test_unbind_and_invalid_team(self):
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': None, 'reason': '球员离队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['from_team_id'], self.team.id)
+        self.assertIsNone(resp.json()['data']['to_team_id'])
+        self.p1.refresh_from_db()
+        self.assertIsNone(self.p1.team_id)
+
+        rejected = Team.objects.create(
+            school=self.school, coach=self.coach_user, name='驳回队',
+            group_type=GroupType.MIDDLE_SCHOOL, status=TeamStatus.REJECTED,
+        )
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}/team', {
+            'team_id': rejected.id, 'reason': '绑定驳回球队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '仅可绑定待审核或已通过的球队')
+
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}/team', {
+            'team_id': 999999, 'reason': '绑定不存在球队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+
+    def test_team_change_required_fields(self):
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p2.id}/team', {'team_id': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('reason', resp.json()['msg'])
+
+        resp = self.admin_client.put(
+            f'/api/admin/players/{self.p2.id}/team', {'reason': '缺少球队'}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('team_id', resp.json()['msg'])
+
+
+class MergePlayerTest(BaseAdminData):
+    def _create_duplicate(self, name='张三', phone='13600000021'):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': name, 'phone': phone, 'id_card': NEW_ID_CARD_1,
+            'gender': 'female', 'grade': '初三',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        return AthleteProfile.objects.get(pk=resp.json()['data']['id'])
+
+    def test_merge_validation(self):
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': self.p1.id, 'reason': '自合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '不能合并同一条档案')
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': self.p2.id, 'reason': '信息不同',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '两人姓名或身份证号需至少一项相同')
+
+        duplicate = self._create_duplicate()
+        AthleteProfile.objects.filter(pk=duplicate.pk).update(team=self.team)
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '都在队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '两人均在有效球队中，请先调整')
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('reason', resp.json()['msg'])
+
+    def test_merge_migrates_relations_and_fills_fields(self):
+        duplicate = self._create_duplicate()
+        add_card_events(duplicate, yellow=1)
+        PlayerTeamChange.objects.create(
+            player=duplicate, from_team=None, to_team=None, reason='历史解绑',
+            changed_by=self.admin.id,
+        )
+        resp = self.admin_client.post(
+            f'/api/admin/players/{duplicate.id}/suspensions',
+            {'reason': '人工停赛', 'matches_count': 2}, format='json',
+        )
+        self.assertEqual(resp.json()['code'], 0)
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '重复档案合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        data = resp.json()['data']
+        self.assertTrue(data['merged'])
+        self.assertEqual(data['primary_id'], self.p1.id)
+        self.assertEqual(data['duplicate_id'], duplicate.id)
+        self.assertIn('grade', data['filled_fields'])
+        self.assertIn('gender', data['filled_fields'])
+
+        # 关联数据迁移到主档案
+        self.assertEqual(MatchEvent.objects.filter(athlete=duplicate).count(), 0)
+        self.assertEqual(MatchEvent.objects.filter(athlete=self.p1).count(), 1)
+        self.assertEqual(PlayerTeamChange.objects.filter(player=duplicate).count(), 0)
+        self.assertEqual(PlayerTeamChange.objects.filter(player=self.p1).count(), 1)
+        self.assertEqual(PlayerSuspension.objects.filter(player=duplicate).count(), 0)
+        self.assertEqual(PlayerSuspension.objects.filter(player=self.p1).count(), 1)
+
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.grade, '初三')
+        self.assertEqual(self.p1.gender, 'female')
+
+        # 重复档案软删 + 账号禁用
+        duplicate.refresh_from_db()
+        self.assertIsNotNone(duplicate.deleted_at)
+        dup_user = duplicate.user
+        dup_user.refresh_from_db()
+        self.assertFalse(dup_user.is_active)
+        self.assertEqual(
+            login(APIClient(), '13600000021', settings.DEFAULT_RESET_PASSWORD).json()['code'],
+            20003,
+        )
+        self.assertTrue(
+            AdminOperationLog.objects.filter(action='合并球员', target_id=self.p1.id).exists(),
+        )
+
+    def test_merge_same_id_card_allowed(self):
+        duplicate = self._create_duplicate(name='李雷')
+        AthleteProfile.objects.filter(pk=duplicate.pk).update(id_card=ID_CARD_1)
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '身份证重复',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+
+# ===========================================================================
+# 阶段二修复测试：停赛资格保护 / 合并继承球队 / 停赛列表
+# ===========================================================================
+
+class SuspensionEligibilityGuardTest(BaseAdminData):
+    def _disqualify(self, pk):
+        resp = self.admin_client.put(f'/api/admin/players/{pk}/status-flags', {
+            'eligibility_status': 'disqualified', 'reason': '资格审查造假属实',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+    def test_manual_suspension_keeps_disqualified(self):
+        self._disqualify(self.p2.id)
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '追加停赛', 'matches_count': 2,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['matches_count'], 2)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'disqualified')
+
+        record = PlayerSuspension.objects.get(player=self.p2)
+        self.assertIsNone(record.prev_eligibility)
+
+    def test_revoke_restores_disqualified(self):
+        self._disqualify(self.p2.id)
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '追加停赛', 'matches_count': 2,
+        }, format='json')
+        sid = resp.json()['data']['id']
+        resp = self.admin_client.put(f'/api/admin/suspensions/{sid}/revoke', {
+            'reason': '撤销',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'disqualified')
+
+    def test_normal_suspend_and_revoke_restores_eligible(self):
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '人工停赛', 'matches_count': 1,
+        }, format='json')
+        sid = resp.json()['data']['id']
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'suspended')
+        resp = self.admin_client.put(f'/api/admin/suspensions/{sid}/revoke', {
+            'reason': '撤销',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'eligible')
+
+    def test_partial_revoke_keeps_suspended(self):
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '停赛1', 'matches_count': 1,
+        }, format='json')
+        sid1 = resp.json()['data']['id']
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '停赛2', 'matches_count': 1,
+        }, format='json')
+        sid2 = resp.json()['data']['id']
+
+        resp = self.admin_client.put(f'/api/admin/suspensions/{sid1}/revoke', {
+            'reason': '撤销第一条',
+        }, format='json')
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'suspended')
+
+        resp = self.admin_client.put(f'/api/admin/suspensions/{sid2}/revoke', {
+            'reason': '撤销第二条',
+        }, format='json')
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'eligible')
+
+    def test_auto_suspension_keeps_disqualified(self):
+        self._disqualify(self.p2.id)
+        add_card_events(self.p2, yellow=4)
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions/generate')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'disqualified')
+        record = PlayerSuspension.objects.get(player=self.p2)
+        self.assertIsNone(record.prev_eligibility)
+
+
+class SuspensionListTest(BaseAdminData):
+    def _create_records(self):
+        self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '停赛1', 'matches_count': 1,
+        }, format='json')
+        resp = self.admin_client.post(f'/api/admin/players/{self.p2.id}/suspensions', {
+            'reason': '停赛2', 'matches_count': 1,
+        }, format='json')
+        sid2 = resp.json()['data']['id']
+        self.admin_client.put(f'/api/admin/suspensions/{sid2}/revoke', {
+            'reason': '撤销第二条',
+        }, format='json')
+
+    def test_list_all_and_order(self):
+        self._create_records()
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/suspensions',
+        ).json()['data']
+        self.assertEqual(data['total'], 2)
+        self.assertGreater(data['list'][0]['id'], data['list'][1]['id'])
+        self.assertEqual(set(data['list'][0]), {
+            'id', 'player_id', 'reason', 'matches_count', 'start_at', 'end_at',
+            'source', 'source_events', 'status', 'created_by', 'created_at',
+        })
+
+    def test_filter_by_status(self):
+        self._create_records()
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/suspensions', {'status': 'active'},
+        ).json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['list'][0]['status'], 'active')
+
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/suspensions', {'status': 'revoked'},
+        ).json()['data']
+        self.assertEqual(data['total'], 1)
+
+    def test_invalid_status_returns_10001(self):
+        resp = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/suspensions', {'status': 'xx'},
+        )
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_page_overflow_returns_real_page(self):
+        self._create_records()
+        data = self.admin_client.get(
+            f'/api/admin/players/{self.p2.id}/suspensions',
+            {'page': 99, 'page_size': 1},
+        ).json()['data']
+        self.assertEqual(data['page'], 2)
+        self.assertEqual(len(data['list']), 1)
+
+    def test_missing_player_30001(self):
+        resp = self.admin_client.get('/api/admin/players/999999/suspensions')
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(resp.json()['code'], 30001)
+        self.assertEqual(resp.json()['msg'], '球员不存在')
+
+
+class MergeTeamInheritTest(BaseAdminData):
+    def _create_duplicate(self, name='王五', phone='13600000022'):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': name, 'phone': phone, 'id_card': NEW_ID_CARD_2,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        return AthleteProfile.objects.get(pk=resp.json()['data']['id'])
+
+    def test_merge_inherits_team_and_writes_change(self):
+        duplicate = self._create_duplicate()
+        AthleteProfile.objects.filter(pk=duplicate.pk).update(team=self.team)
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '重复档案合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.team_id, self.team.id)
+
+        change = PlayerTeamChange.objects.get(player=self.p2)
+        self.assertIsNone(change.from_team_id)
+        self.assertEqual(change.to_team_id, self.team.id)
+        self.assertEqual(change.reason, '合并档案继承')
+        self.assertEqual(change.changed_by, self.admin.id)
+
+    def test_merge_primary_has_team_no_change(self):
+        duplicate = self._create_duplicate(name='张三', phone='13600000023')
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.team_id, self.team.id)
+        self.assertEqual(PlayerTeamChange.objects.filter(player=self.p1).count(), 0)
+
+    def test_merge_both_no_team(self):
+        duplicate = self._create_duplicate()
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertIsNone(self.p2.team_id)
+        self.assertEqual(PlayerTeamChange.objects.filter(player=self.p2).count(), 0)
+
+    def test_merge_inherit_rejected_team_skipped(self):
+        duplicate = self._create_duplicate()
+        Team.objects.filter(pk=self.team.pk).update(status=TeamStatus.REJECTED)
+        AthleteProfile.objects.filter(pk=duplicate.pk).update(team=self.team)
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertIsNone(self.p2.team_id)
+        self.assertEqual(PlayerTeamChange.objects.filter(player=self.p2).count(), 0)
+
+    def test_merge_inherit_pending_team_ok(self):
+        duplicate = self._create_duplicate()
+        Team.objects.filter(pk=self.team.pk).update(status=TeamStatus.PENDING)
+        AthleteProfile.objects.filter(pk=duplicate.pk).update(team=self.team)
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.team_id, self.team.id)
+        self.assertTrue(
+            PlayerTeamChange.objects.filter(
+                player=self.p2, to_team=self.team, reason='合并档案继承',
+            ).exists(),
+        )
+
+
+# ===========================================================================
+# 阶段二小瑕疵修复测试
+# ===========================================================================
+
+class MergeSuspensionSyncTest(BaseAdminData):
+    def _create_duplicate(self, name='王五', phone='13600000031'):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': name, 'phone': phone, 'id_card': NEW_ID_CARD_3,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        return AthleteProfile.objects.get(pk=resp.json()['data']['id'])
+
+    def test_merge_active_suspension_sets_primary_suspended(self):
+        # 主档案 eligible，重复档案有 active 停赛
+        duplicate = self._create_duplicate()
+        resp = self.admin_client.post(
+            f'/api/admin/players/{duplicate.id}/suspensions',
+            {'reason': '重复档案停赛', 'matches_count': 2}, format='json',
+        )
+        sid = resp.json()['data']['id']
+
+        # 确认主档案当前 eligible
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'eligible')
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+        # 合并后主档案 eligibility_status 被置为 suspended
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'suspended')
+        # 停赛记录已迁移到主档案
+        self.assertTrue(
+            PlayerSuspension.objects.filter(player=self.p2, pk=sid).exists(),
+        )
+        self.assertFalse(PlayerSuspension.objects.filter(player=duplicate).exists())
+
+        # 撤销后恢复
+        resp = self.admin_client.put(f'/api/admin/suspensions/{sid}/revoke', {
+            'reason': '撤销',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'eligible')
+
+    def test_merge_active_suspension_does_not_override_disqualified(self):
+        duplicate = self._create_duplicate()
+        resp = self.admin_client.post(
+            f'/api/admin/players/{duplicate.id}/suspensions',
+            {'reason': '重复档案停赛', 'matches_count': 1}, format='json',
+        )
+
+        # 主档案置为 disqualified
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}/status-flags', {
+            'eligibility_status': 'disqualified', 'reason': '资格审查造假属实',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+
+        resp = self.admin_client.post('/api/admin/players/merge', {
+            'primary_id': self.p2.id, 'duplicate_id': duplicate.id, 'reason': '合并',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.eligibility_status, 'disqualified')
+        # 停赛记录正常迁移过来
+        self.assertEqual(
+            PlayerSuspension.objects.filter(player=self.p2, status='active').count(), 1,
+        )
+
+
+class ChangeTeamNoiseTest(BaseAdminData):
+    def test_same_team_change_blocked(self):
+        before = PlayerTeamChange.objects.count()
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': self.team.id, 'reason': '换到同一队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该球员已在该球队中')
+        self.assertEqual(PlayerTeamChange.objects.count(), before)
+
+    def test_unbind_empty_team_blocked(self):
+        before = PlayerTeamChange.objects.count()
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}/team', {
+            'team_id': None, 'reason': '解绑无球队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertEqual(resp.json()['msg'], '该球员已在该球队中')
+        self.assertEqual(PlayerTeamChange.objects.count(), before)
+
+    def test_regular_move_and_unbind_unchanged(self):
+        # 在 A 队换到 B 队（换队）
+        team2 = Team.objects.create(
+            school=self.school, coach=self.coach_user, name='测试二队',
+            group_type=GroupType.MIDDLE_SCHOOL,
+        )
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': team2.id, 'reason': '换队',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.team_id, team2.id)
+
+        # 从 B 队解绑
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': None, 'reason': '解绑',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.p1.refresh_from_db()
+        self.assertIsNone(self.p1.team_id)

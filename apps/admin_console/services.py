@@ -23,7 +23,7 @@ from apps.org.models import School, Team, TeamStatus
 from apps.registration.models import Registration
 
 from .masking import mask_id_card, mask_phone
-from .models import AdminOperationLog, CoachObjection
+from .models import AdminOperationLog, CoachObjection, PlayerSuspension, PlayerTeamChange
 
 User = get_user_model()
 
@@ -210,6 +210,7 @@ def _player_list_item(profile: AthleteProfile) -> dict:
     return {
         'id': profile.id,
         'name': profile.name,
+        'gender': profile.gender,
         'jersey_no': profile.jersey_no,
         'position': profile.position,
         'team_id': profile.team_id,
@@ -233,11 +234,18 @@ def _player_list_item(profile: AthleteProfile) -> dict:
 
 def _player_detail(profile: AthleteProfile) -> dict:
     data = _player_list_item(profile)
+    latest = profile.suspensions.order_by('-id').first()
     data.update({
         'id_card': mask_id_card(profile.id_card),
         'phone': mask_phone(profile.user.phone or '') if profile.user_id else '',
         'enrollment_cert': profile.enrollment_cert_path,
         'reject_reason': profile.reject_reason,
+        'suspensions': {
+            'active_count': profile.suspensions.filter(
+                status=PlayerSuspension.Status.ACTIVE,
+            ).count(),
+            'latest': _suspension_item(latest) if latest else None,
+        },
         'updated_at': format_dt(profile.updated_at),
     })
     return data
@@ -303,6 +311,7 @@ def create_player(request, data: dict) -> dict:
         name=data['name'],
         id_card=id_card,
         school=school,
+        gender=data.get('gender'),
         grade=data.get('grade') or None,
         position=data.get('position') or None,
         jersey_no=data.get('jersey_no'),
@@ -329,6 +338,7 @@ def update_player(request, pk: int, data: dict) -> dict:
         'position': 'position',
         'avatar': 'avatar_path',
         'id_card': 'id_card',
+        'gender': 'gender',
         'grade': 'grade',
         'height_cm': 'height_cm',
         'weight_kg': 'weight_kg',
@@ -865,3 +875,393 @@ def handle_objection(request, pk: int, data: dict) -> dict:
         after['note'] = note
     _log(request, '处理公示异议', 'coach', obj.coach_id, before, after)
     return after
+
+
+# ---------------------------------------------------------------------------
+# 停赛联动（阶段二）
+# ---------------------------------------------------------------------------
+
+def _suspension_rules() -> dict:
+    rules = getattr(settings, 'SUSPENSION_RULES', {}) or {}
+    return {
+        'yellow_threshold': int(rules.get('yellow_threshold', 4)),
+        'yellow_ban_matches': int(rules.get('yellow_ban_matches', 1)),
+        'red_ban_matches': int(rules.get('red_ban_matches', 2)),
+    }
+
+
+def _suspension_item(record: PlayerSuspension) -> dict:
+    return {
+        'id': record.id,
+        'player_id': record.player_id,
+        'reason': record.reason,
+        'matches_count': record.matches_count,
+        'start_at': format_dt(record.start_at),
+        'end_at': format_dt(record.end_at),
+        'source': record.source,
+        'source_events': record.source_events or [],
+        'status': record.status,
+        'created_by': record.created_by,
+        'created_at': format_dt(record.created_at),
+    }
+
+
+def _suspend_player_if_needed(player, request):
+    """若球员当前未被取消资格，则置为停赛中并把原状态写入 prev_eligibility。
+
+    返回 prev_eligibility 值；取消资格的球员返回 None（不停赛记录原状态）。
+    """
+    if player.eligibility_status == EligibilityStatus.DISQUALIFIED:
+        return None
+    prev = player.eligibility_status
+    player.eligibility_status = EligibilityStatus.SUSPENDED
+    player.updated_at = timezone.now()
+    player.save(update_fields=['eligibility_status', 'updated_at'])
+    return prev
+
+
+def _card_events(player: AthleteProfile) -> list:
+    return list(
+        MatchEvent.objects
+        .filter(athlete=player, type__in=('yellow', 'red'))
+        .order_by('created_at', 'id')
+    )
+
+
+def _consumed_event_ids(player: AthleteProfile) -> set:
+    """已被任意停赛记录计入过的红黄牌事件 id（含已撤销 / 已结束记录，保证幂等）。"""
+    consumed = set()
+    for record in PlayerSuspension.objects.filter(player=player):
+        for event_id in record.source_events or []:
+            consumed.add(int(event_id))
+    return consumed
+
+
+def suspension_preview(request, pk: int) -> dict:
+    """停赛提示：纯计算不落库。"""
+    player = _get_player(pk)
+    events = _card_events(player)
+    consumed = _consumed_event_ids(player)
+    rule = _suspension_rules()
+    yellow_events = [event for event in events if event.type == 'yellow']
+    red_events = [event for event in events if event.type == 'red']
+    yellow_since = len([event for event in yellow_events if event.id not in consumed])
+    red_since = len([event for event in red_events if event.id not in consumed])
+    return {
+        'yellow_total': len(yellow_events),
+        'red_total': len(red_events),
+        'yellow_since_last_ban': yellow_since,
+        'will_suspend': red_since > 0 or yellow_since >= rule['yellow_threshold'],
+        'rule': rule,
+    }
+
+
+def list_suspensions(request, pk: int, params: dict) -> dict:
+    player = _get_player(pk)
+    qs = PlayerSuspension.objects.filter(player=player).order_by('-id')
+    if params.get('status'):
+        qs = qs.filter(status=params['status'])
+    data = _paginate(qs, request)
+    data['list'] = [_suspension_item(record) for record in data['list']]
+    return data
+
+
+def _create_suspension(player, reason, matches_count, source, events, start_at, request, prev_eligibility=None):
+    return PlayerSuspension.objects.create(
+        player=player,
+        reason=reason,
+        matches_count=matches_count,
+        start_at=start_at,
+        # 场次由赛事方执行，不设固定结束时间
+        end_at=None,
+        source=source,
+        source_events=events,
+        prev_eligibility=prev_eligibility,
+        status=PlayerSuspension.Status.ACTIVE,
+        created_by=request.user.id,
+    )
+
+
+@transaction.atomic
+def generate_suspension(request, pk: int) -> dict:
+    """按红黄牌累计自动生成停赛记录（幂等：已计入的事件不重复）。"""
+    player = _get_player(pk, for_update=True)
+    events = _card_events(player)
+    consumed = _consumed_event_ids(player)
+    rule = _suspension_rules()
+    new_yellow = [event for event in events if event.type == 'yellow' and event.id not in consumed]
+    new_red = [event for event in events if event.type == 'red' and event.id not in consumed]
+
+    created = []
+    now = timezone.now()
+    prev = _suspend_player_if_needed(player, request)
+    if new_red:
+        record = _create_suspension(
+            player, f'红牌停赛（{len(new_red)} 张红牌）', rule['red_ban_matches'],
+            PlayerSuspension.Source.AUTO, [event.id for event in new_red], now, request,
+            prev_eligibility=prev,
+        )
+        created.append(_suspension_item(record))
+    if len(new_yellow) >= rule['yellow_threshold']:
+        record = _create_suspension(
+            player, f'累计 {len(new_yellow)} 张黄牌停赛', rule['yellow_ban_matches'],
+            PlayerSuspension.Source.AUTO, [event.id for event in new_yellow], now, request,
+            prev_eligibility=prev,
+        )
+        created.append(_suspension_item(record))
+
+    if not created:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '未达到停赛条件')
+
+    _log(request, '自动生成停赛记录', 'player', player.id, None, {'created': created})
+    return {'created': created}
+
+
+@transaction.atomic
+def create_manual_suspension(request, pk: int, data: dict) -> dict:
+    player = _get_player(pk, for_update=True)
+    now = timezone.now()
+    # 取消资格的球员不覆盖状态；否则仅首条生效停赛记录原状态
+    if player.eligibility_status == EligibilityStatus.DISQUALIFIED:
+        prev = None
+    else:
+        has_active = PlayerSuspension.objects.filter(
+            player=player, status=PlayerSuspension.Status.ACTIVE,
+        ).exists()
+        if has_active:
+            prev = None
+            if player.eligibility_status != EligibilityStatus.SUSPENDED:
+                player.eligibility_status = EligibilityStatus.SUSPENDED
+                player.updated_at = now
+                player.save(update_fields=['eligibility_status', 'updated_at'])
+        else:
+            prev = _suspend_player_if_needed(player, request)
+    record = _create_suspension(
+        player, data['reason'].strip(), data['matches_count'], PlayerSuspension.Source.MANUAL,
+        [], data.get('start_at') or now, request, prev_eligibility=prev,
+    )
+
+    item = _suspension_item(record)
+    _log(request, '人工停赛', 'player', player.id, None, item)
+    return item
+
+
+@transaction.atomic
+def revoke_suspension(request, pk: int, data: dict) -> dict:
+    record = (PlayerSuspension.objects
+              .select_related('player')
+              .filter(pk=pk)
+              .first())
+    if record is None:
+        raise BusinessException(ResponseCode.NOT_FOUND, '停赛记录不存在', status_code=404)
+    if record.status != PlayerSuspension.Status.ACTIVE:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '该停赛记录已结束')
+
+    before = _suspension_item(record)
+    record.status = PlayerSuspension.Status.REVOKED
+    record.save(update_fields=['status'])
+
+    player = record.player
+    remaining = PlayerSuspension.objects.filter(
+        player=player, status=PlayerSuspension.Status.ACTIVE,
+    ).exists()
+    if not remaining:
+        # 恢复为该球员最近一次已撤销记录的 prev_eligibility（为空回退 eligible）
+        restore_to = (
+            PlayerSuspension.objects
+            .filter(player=player, status=PlayerSuspension.Status.REVOKED)
+            .exclude(prev_eligibility__isnull=True)
+            .order_by('-id')
+            .values_list('prev_eligibility', flat=True)
+            .first()
+        )
+        if restore_to is None:
+            # 历史数据兼容：从未记录过 prev_eligibility 的旧数据
+            restore_to = (
+                EligibilityStatus.DISQUALIFIED
+                if player.eligibility_status == EligibilityStatus.DISQUALIFIED
+                else EligibilityStatus.ELIGIBLE
+            )
+        if player.eligibility_status != restore_to:
+            player.eligibility_status = restore_to
+            player.updated_at = timezone.now()
+            player.save(update_fields=['eligibility_status', 'updated_at'])
+
+    after = _suspension_item(record)
+    after['reason'] = data['reason'].strip()  # 撤销原因留痕
+    _log(request, '撤销停赛记录', 'player', player.id, before, after)
+    return after
+
+
+# ---------------------------------------------------------------------------
+# 球队归属变更（阶段二）
+# ---------------------------------------------------------------------------
+
+def _team_change_item(change: PlayerTeamChange) -> dict:
+    return {
+        'id': change.id,
+        'player_id': change.player_id,
+        'from_team_id': change.from_team_id,
+        'from_team_name': change.from_team.name if change.from_team_id and change.from_team else None,
+        'to_team_id': change.to_team_id,
+        'to_team_name': change.to_team.name if change.to_team_id and change.to_team else None,
+        'reason': change.reason,
+        'changed_by': change.changed_by,
+        'created_at': format_dt(change.created_at),
+    }
+
+
+def _active_team(team_id):
+    if team_id is None:
+        return None
+    team = Team.objects.filter(pk=team_id).first()
+    if team is None or team.status not in ACTIVE_TEAM_STATUSES:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅可绑定待审核或已通过的球队')
+    return team
+
+
+@transaction.atomic
+def change_player_team(request, pk: int, data: dict) -> dict:
+    player = _get_player(pk, for_update=True)
+    from_team = player.team if player.team_id else None
+    to_team = _active_team(data['team_id'])
+    reason = data['reason'].strip()
+
+    # 噪音变更拦截：换同队、空队解绑
+    if (from_team.id if from_team else None) == (to_team.id if to_team else None):
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员已在该球队中')
+
+    change = PlayerTeamChange.objects.create(
+        player=player,
+        from_team=from_team,
+        to_team=to_team,
+        reason=reason,
+        changed_by=request.user.id,
+    )
+    player.team = to_team
+    player.updated_at = timezone.now()
+    player.save(update_fields=['team', 'updated_at'])
+
+    before = {
+        'team_id': from_team.id if from_team else None,
+        'team_name': from_team.name if from_team else None,
+    }
+    after = {
+        'team_id': to_team.id if to_team else None,
+        'team_name': to_team.name if to_team else None,
+        'reason': reason,
+    }
+    _log(request, '球员归属变更', 'player', player.id, before, after)
+    return _team_change_item(change)
+
+
+def list_team_changes(request, pk: int, params: dict) -> dict:
+    player = _get_player(pk)
+    qs = (PlayerTeamChange.objects
+          .filter(player=player)
+          .select_related('from_team', 'to_team')
+          .order_by('-id'))
+    data = _paginate(qs, request)
+    data['list'] = [_team_change_item(change) for change in data['list']]
+    return data
+
+
+# ---------------------------------------------------------------------------
+# 合并重复档案（阶段二）
+# ---------------------------------------------------------------------------
+
+# 主档案缺失时从重复档案补齐的字段（"基本信息"类）
+MERGE_FILL_FIELDS = (
+    'school_id', 'gender', 'grade', 'height_cm', 'weight_kg',
+    'avatar_path', 'position', 'jersey_no', 'id_card',
+)
+
+
+def _fill_missing_fields(primary, duplicate):
+    filled = []
+    for field in MERGE_FILL_FIELDS:
+        if getattr(primary, field) in (None, '') and getattr(duplicate, field) not in (None, ''):
+            setattr(primary, field, getattr(duplicate, field))
+            filled.append(field)
+    return filled
+
+
+def _in_active_team(player: AthleteProfile) -> bool:
+    return bool(player.team_id) and player.team.status in ACTIVE_TEAM_STATUSES
+
+
+@transaction.atomic
+def merge_players(request, data: dict) -> dict:
+    primary = _get_player(data['primary_id'], for_update=True)
+    duplicate = _get_player(data['duplicate_id'], for_update=True)
+
+    if primary.id == duplicate.id:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '不能合并同一条档案')
+    same_name = primary.name == duplicate.name
+    same_id_card = bool(primary.id_card) and primary.id_card == duplicate.id_card
+    if not same_name and not same_id_card:
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '两人姓名或身份证号需至少一项相同')
+    if _in_active_team(primary) and _in_active_team(duplicate):
+        raise BusinessException(ResponseCode.BUSINESS_ERROR, '两人均在有效球队中，请先调整')
+
+    reason = data['reason'].strip()
+    before = _player_detail(duplicate)
+
+    # 关联数据统一迁移到主档案
+    MatchEvent.objects.filter(athlete=duplicate).update(athlete=primary)
+    PlayerTeamChange.objects.filter(player=duplicate).update(player=primary)
+    PlayerSuspension.objects.filter(player=duplicate).update(player=primary)
+
+    filled = _fill_missing_fields(primary, duplicate)
+    # 球队归属继承：主档案无队、重复档案有队且球队处于有效状态时才继承并写变更记录
+    if (
+        not primary.team_id and duplicate.team_id
+        and duplicate.team.status in ACTIVE_TEAM_STATUSES
+    ):
+        inherited = duplicate.team
+        PlayerTeamChange.objects.create(
+            player=primary,
+            from_team=None,
+            to_team=inherited,
+            reason='合并档案继承',
+            changed_by=request.user.id,
+        )
+        primary.team = inherited
+        filled.append('team_id')
+    # 停赛资格同步：迁移后若主档案存在生效停赛且当前不是 suspended/disqualified，置为 suspended
+    has_active_suspension = PlayerSuspension.objects.filter(
+        player=primary, status=PlayerSuspension.Status.ACTIVE,
+    ).exists()
+    if has_active_suspension:
+        if primary.eligibility_status not in (
+            EligibilityStatus.SUSPENDED, EligibilityStatus.DISQUALIFIED,
+        ):
+            primary.eligibility_status = EligibilityStatus.SUSPENDED
+            filled.append('eligibility_status')
+    if filled:
+        primary.updated_at = timezone.now()
+        primary.save(update_fields=list(set(filled)) + ['updated_at'])
+
+    now = timezone.now()
+    fields = ['deleted_at', 'updated_at']
+    duplicate.deleted_at = now
+    duplicate.updated_at = now
+    if duplicate.is_public:
+        duplicate.is_public = False
+        fields.append('is_public')
+    duplicate.save(update_fields=fields)
+
+    # 重复账号软删并禁用登录；User 不合并不删除（登录标识隔离，恢复留余地）
+    _disable_user_account(duplicate.user)
+
+    _log(
+        request, '合并球员', 'player', primary.id, before,
+        {'primary_id': primary.id, 'duplicate_id': duplicate.id, 'filled_fields': filled,
+         'reason': reason},
+    )
+    return {
+        'primary_id': primary.id,
+        'duplicate_id': duplicate.id,
+        'merged': True,
+        'filled_fields': filled,
+    }

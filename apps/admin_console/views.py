@@ -14,13 +14,18 @@ from .serializers import (
     CoachQuerySerializer,
     CoachUnpublishSerializer,
     CoachUpdateSerializer,
+    MergePlayerSerializer,
     ObjectionHandleSerializer,
     ObjectionQuerySerializer,
     PlayerCreateSerializer,
     PlayerQuerySerializer,
     PlayerStatusFlagsSerializer,
+    PlayerTeamSerializer,
     PlayerUpdateSerializer,
     ResetPasswordSerializer,
+    SuspensionManualSerializer,
+    SuspensionQuerySerializer,
+    SuspensionRevokeSerializer,
 )
 
 ADMIN_ONLY = [IsAuthenticated, role_permission('admin')]
@@ -112,6 +117,68 @@ class PlayerRestoreView(APIView):
 
     def post(self, request, pk: int):
         return Response(services.restore_player(request, pk))
+
+
+class PlayerSuspensionPreviewView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def get(self, request, pk: int):
+        return Response(services.suspension_preview(request, pk))
+
+
+class PlayerSuspensionGenerateView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def post(self, request, pk: int):
+        return Response(services.generate_suspension(request, pk))
+
+
+class PlayerSuspensionListView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def get(self, request, pk: int):
+        serializer = SuspensionQuerySerializer(data=request.query_params)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.list_suspensions(request, pk, serializer.validated_data))
+
+    def post(self, request, pk: int):
+        serializer = SuspensionManualSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.create_manual_suspension(request, pk, serializer.validated_data))
+
+
+class SuspensionRevokeView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def put(self, request, pk: int):
+        serializer = SuspensionRevokeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.revoke_suspension(request, pk, serializer.validated_data))
+
+
+class PlayerTeamView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def put(self, request, pk: int):
+        serializer = PlayerTeamSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.change_player_team(request, pk, serializer.validated_data))
+
+
+class PlayerTeamChangesView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def get(self, request, pk: int):
+        return Response(services.list_team_changes(request, pk, request.query_params))
+
+
+class PlayerMergeView(APIView):
+    permission_classes = ADMIN_ONLY
+
+    def post(self, request):
+        serializer = MergePlayerSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return Response(services.merge_players(request, serializer.validated_data))
 
 
 # --------------------------- 教练员 ---------------------------

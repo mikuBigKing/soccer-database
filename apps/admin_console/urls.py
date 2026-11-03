@@ -16,15 +16,23 @@ from .views import (
     PlayerBatchResetPasswordView,
     PlayerDetailView,
     PlayerListView,
+    PlayerMergeView,
     PlayerPublishView,
     PlayerResetPasswordView,
     PlayerRestoreView,
     PlayerStatusFlagsView,
+    PlayerSuspensionGenerateView,
+    PlayerSuspensionListView,
+    PlayerSuspensionPreviewView,
+    PlayerTeamChangesView,
+    PlayerTeamView,
     PlayerUnpublishView,
+    SuspensionRevokeView,
 )
 
 urlpatterns = [
     path('players', PlayerListView.as_view()),
+    path('players/merge', PlayerMergeView.as_view()),
     path('players/batch-reset-password', PlayerBatchResetPasswordView.as_view()),
     path('players/<int:pk>', PlayerDetailView.as_view()),
     path('players/<int:pk>/publish', PlayerPublishView.as_view()),
@@ -33,6 +41,13 @@ urlpatterns = [
     path('players/<int:pk>/status-flags', PlayerStatusFlagsView.as_view()),
     path('players/<int:pk>/account-status', PlayerAccountStatusView.as_view()),
     path('players/<int:pk>/restore', PlayerRestoreView.as_view()),
+    path('players/<int:pk>/suspension-preview', PlayerSuspensionPreviewView.as_view()),
+    path('players/<int:pk>/suspensions/generate', PlayerSuspensionGenerateView.as_view()),
+    path('players/<int:pk>/suspensions', PlayerSuspensionListView.as_view()),
+    path('players/<int:pk>/team', PlayerTeamView.as_view()),
+    path('players/<int:pk>/team-changes', PlayerTeamChangesView.as_view()),
+
+    path('suspensions/<int:pk>/revoke', SuspensionRevokeView.as_view()),
 
     path('coaches', CoachListView.as_view()),
     path('coaches/batch-reset-password', CoachBatchResetPasswordView.as_view()),

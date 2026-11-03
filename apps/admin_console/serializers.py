@@ -6,7 +6,7 @@
 from django.conf import settings
 from rest_framework import serializers
 
-from apps.accounts.models import EligibilityStatus, ProfileStatus, VerifyStatus
+from apps.accounts.models import EligibilityStatus, Gender, ProfileStatus, VerifyStatus
 from apps.org.models import GroupType
 
 ID_CARD_WEIGHTS = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
@@ -92,6 +92,9 @@ class PlayerUpdateSerializer(serializers.Serializer):
     school_id = serializers.IntegerField(
         required=False, allow_null=True, min_value=1, error_messages=INT_ERRORS,
     )
+    gender = serializers.ChoiceField(
+        required=False, allow_null=True, choices=Gender.choices, error_messages=CHOICE_ERRORS,
+    )
     grade = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=20)
     height_cm = serializers.IntegerField(
         required=False, allow_null=True, min_value=0, max_value=220,
@@ -140,8 +143,9 @@ class PlayerCreateSerializer(serializers.Serializer):
         required=False, allow_null=True, min_value=0, max_value=220,
         error_messages={'invalid': '必须为整数', 'min_value': '取值范围 0–220', 'max_value': '取值范围 0–220'},
     )
-    # 本仓库 AthleteProfile 暂无 gender 列：这里仅接收以兼容前端入参，不落库（阶段报告已注明）
-    gender = serializers.CharField(required=False, allow_blank=True, allow_null=True, max_length=10)
+    gender = serializers.ChoiceField(
+        required=False, allow_null=True, choices=Gender.choices, error_messages=CHOICE_ERRORS,
+    )
 
     def validate_id_card(self, value):
         return validate_id_card(value)
@@ -245,3 +249,42 @@ class AccountStatusSerializer(serializers.Serializer):
         if attrs['action'] == 'disable' and len((attrs.get('reason') or '').strip()) < 5:
             raise serializers.ValidationError({'reason': '禁用账号必须填写不少于 5 个字的 reason'})
         return attrs
+
+
+class SuspensionManualSerializer(serializers.Serializer):
+    reason = serializers.CharField(max_length=200)
+    matches_count = serializers.IntegerField(
+        min_value=1, max_value=100,
+        error_messages={'invalid': '必须为整数', 'min_value': '停赛场次至少 1', 'max_value': '停赛场次最多 100'},
+    )
+    start_at = serializers.DateTimeField(required=False, allow_null=True)
+
+
+class SuspensionRevokeSerializer(serializers.Serializer):
+    reason = serializers.CharField(
+        max_length=200,
+        error_messages={'required': '撤销停赛必须填写原因', 'blank': '撤销停赛必须填写原因'},
+    )
+
+
+class PlayerTeamSerializer(serializers.Serializer):
+    team_id = serializers.IntegerField(
+        required=True, allow_null=True, min_value=1, error_messages=INT_ERRORS,
+    )
+    reason = serializers.CharField(max_length=200)
+
+
+class MergePlayerSerializer(serializers.Serializer):
+    primary_id = serializers.IntegerField(min_value=1, error_messages=INT_ERRORS)
+    duplicate_id = serializers.IntegerField(min_value=1, error_messages=INT_ERRORS)
+    reason = serializers.CharField(max_length=200)
+
+
+class SuspensionQuerySerializer(serializers.Serializer):
+    page = serializers.IntegerField(required=False, min_value=1, error_messages=INT_ERRORS)
+    page_size = serializers.IntegerField(required=False, min_value=1, error_messages=INT_ERRORS)
+    status = serializers.ChoiceField(
+        required=False,
+        choices=[('active', '生效中'), ('revoked', '已撤销'), ('expired', '已结束')],
+        error_messages={'invalid_choice': '取值不合法'},
+    )

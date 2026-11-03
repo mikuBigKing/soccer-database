@@ -129,6 +129,13 @@ DEFAULT_RESET_PASSWORD = os.getenv('DEFAULT_RESET_PASSWORD', 'Abc@123456')
 # 管理员自定义重置密码时的密码策略（字母 + 数字，8–64 位）
 PASSWORD_POLICY = os.getenv('PASSWORD_POLICY', r'^(?=.*[A-Za-z])(?=.*\d).{8,64}$')
 
+# 停赛规则（红黄牌累计自动停赛）
+SUSPENSION_RULES = {
+    'yellow_threshold': 4,        # 累计 4 张黄牌
+    'yellow_ban_matches': 1,      # 停赛 1 场
+    'red_ban_matches': 2,         # 红牌停 2 场
+}
+
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 

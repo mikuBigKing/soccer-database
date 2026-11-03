@@ -5,10 +5,15 @@
 - 响应字段名与契约文档逐字一致（avatar ← avatar_path 等）；
 - 所有查询显式过滤 deleted_at__isnull=True（仓库无软删 manager）。
 """
+import io
+import os
+from datetime import date
+
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
 from django.db.models import Q
+from django.http import StreamingHttpResponse
 from django.utils import timezone
 
 from apps.accounts.models import (
@@ -191,17 +196,21 @@ def _get_school(school_id):
 # 球员
 # ---------------------------------------------------------------------------
 
-def _get_player(pk: int, for_update: bool = False, with_deleted: bool = False) -> AthleteProfile:
+def _get_player(pk: int, for_update: bool = False, with_deleted: bool = False, request=None) -> AthleteProfile:
     qs = AthleteProfile.objects.select_related('user', 'team__school', 'school')
     if for_update:
         # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
         qs = qs.select_for_update()
     try:
         if with_deleted:
-            return qs.get(pk=pk)
-        return qs.get(pk=pk, deleted_at__isnull=True)
+            profile = qs.get(pk=pk)
+        else:
+            profile = qs.get(pk=pk, deleted_at__isnull=True)
     except AthleteProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
+    if request is not None and getattr(request, 'user', None) is not None:
+        _ensure_in_scope(request.user, profile, kind='player')
+    return profile
 
 
 def _player_list_item(profile: AthleteProfile) -> dict:
@@ -255,6 +264,7 @@ def list_players(request, params: dict) -> dict:
     qs = (AthleteProfile.objects
           .select_related('team__school', 'school')
           .order_by('-created_at'))
+    qs = apply_scope(qs, request.user, kind='player')
     if params.get('deleted'):
         qs = qs.filter(deleted_at__isnull=False)
     else:
@@ -287,8 +297,8 @@ def list_players(request, params: dict) -> dict:
     return data
 
 
-def get_player(pk: int) -> dict:
-    return _player_detail(_get_player(pk))
+def get_player(request, pk: int) -> dict:
+    return _player_detail(_get_player(pk, request=request))
 
 
 @transaction.atomic
@@ -299,6 +309,7 @@ def create_player(request, data: dict) -> dict:
     _ensure_id_card_available(id_card, AthleteProfile, None)
 
     school = _get_school(data['school_id']) if data.get('school_id') else None
+    _ensure_school_in_scope(request.user, school)
     user = User.objects.create_user(
         username=phone,
         phone=phone,
@@ -328,7 +339,7 @@ def create_player(request, data: dict) -> dict:
 
 @transaction.atomic
 def update_player(request, pk: int, data: dict) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     before = _player_detail(player)
 
     changed = []
@@ -379,7 +390,7 @@ def update_player_status_flags(request, pk: int, data: dict) -> dict:
 
     说明：eligibility_status 改 suspended 时不生成停赛记录（停赛记录在阶段二打通）。
     """
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     before = _player_detail(player)
 
     changed = []
@@ -403,7 +414,7 @@ def update_player_status_flags(request, pk: int, data: dict) -> dict:
 
 @transaction.atomic
 def delete_player(request, pk: int) -> dict:
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     # 只拦「待审核 / 已通过」的球队；球队已驳回时球员可删除
     if player.team_id and player.team.status in ACTIVE_TEAM_STATUSES:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员已加入球队，不可删除')
@@ -433,7 +444,7 @@ def delete_player(request, pk: int) -> dict:
 
 @transaction.atomic
 def publish_player(request, pk: int) -> dict:
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     if player.status != ProfileStatus.APPROVED:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅审核通过的球员可公示')
     if player.is_public:
@@ -450,7 +461,7 @@ def publish_player(request, pk: int) -> dict:
 
 @transaction.atomic
 def unpublish_player(request, pk: int) -> dict:
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     if not player.is_public:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员未公示')
 
@@ -470,7 +481,7 @@ def _reset_password_value(data) -> str:
 
 @transaction.atomic
 def reset_player_password(request, pk: int, data=None) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     password = _reset_password_value(data)
     player.user.set_password(password)
     player.user.save(update_fields=['password'])
@@ -507,7 +518,7 @@ def batch_reset_player_password(request, data: dict) -> dict:
 
 @transaction.atomic
 def restore_player(request, pk: int) -> dict:
-    player = _get_player(pk, with_deleted=True)
+    player = _get_player(pk, with_deleted=True, request=request)
     if player.deleted_at is None:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该球员未在归档中')
 
@@ -532,7 +543,7 @@ def restore_player(request, pk: int) -> dict:
 
 @transaction.atomic
 def update_player_account_status(request, pk: int, data: dict) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     user = player.user
     before = {'status': user.status, 'is_active': user.is_active}
 
@@ -550,17 +561,21 @@ def update_player_account_status(request, pk: int, data: dict) -> dict:
 # 教练员
 # ---------------------------------------------------------------------------
 
-def _get_coach(pk: int, for_update: bool = False, with_deleted: bool = False) -> CoachProfile:
+def _get_coach(pk: int, for_update: bool = False, with_deleted: bool = False, request=None) -> CoachProfile:
     qs = CoachProfile.objects.select_related('user')
     if for_update:
         # 公示类操作的「查 → 判断 → 改」需要行锁，避免并发重复公示
         qs = qs.select_for_update()
     try:
         if with_deleted:
-            return qs.get(pk=pk)
-        return qs.get(pk=pk, deleted_at__isnull=True)
+            profile = qs.get(pk=pk)
+        else:
+            profile = qs.get(pk=pk, deleted_at__isnull=True)
     except CoachProfile.DoesNotExist:
         raise BusinessException(ResponseCode.NOT_FOUND, '教练员不存在', status_code=404)
+    if request is not None and getattr(request, 'user', None) is not None:
+        _ensure_in_scope(request.user, profile, kind='coach')
+    return profile
 
 
 def _coach_list_item(profile: CoachProfile) -> dict:
@@ -596,7 +611,8 @@ def _coach_detail(profile: CoachProfile) -> dict:
 
 
 def list_coaches(request, params: dict) -> dict:
-    qs = CoachProfile.objects.order_by('-created_at')
+    qs = CoachProfile.objects.prefetch_related('user__coached_teams__school').order_by('-created_at')
+    qs = apply_scope(qs, request.user, kind='coach')
     if params.get('deleted'):
         qs = qs.filter(deleted_at__isnull=False)
     else:
@@ -629,13 +645,13 @@ def list_coaches(request, params: dict) -> dict:
     return data
 
 
-def get_coach(pk: int) -> dict:
-    return _coach_detail(_get_coach(pk))
+def get_coach(request, pk: int) -> dict:
+    return _coach_detail(_get_coach(pk, request=request))
 
 
 @transaction.atomic
 def update_coach(request, pk: int, data: dict) -> dict:
-    coach = _get_coach(pk)
+    coach = _get_coach(pk, request=request)
     before = _coach_detail(coach)
 
     changed = []
@@ -672,7 +688,7 @@ def update_coach(request, pk: int, data: dict) -> dict:
 
 @transaction.atomic
 def delete_coach(request, pk: int) -> dict:
-    coach = _get_coach(pk, for_update=True)
+    coach = _get_coach(pk, for_update=True, request=request)
     # 只拦「待审核 / 已通过」的球队；球队已驳回时教练可删除
     active_teams = Team.objects.filter(coach=coach.user, status__in=ACTIVE_TEAM_STATUSES)
     if active_teams.exists():
@@ -706,7 +722,7 @@ def delete_coach(request, pk: int) -> dict:
 
 @transaction.atomic
 def publish_coach(request, pk: int, data=None) -> dict:
-    coach = _get_coach(pk, for_update=True)
+    coach = _get_coach(pk, for_update=True, request=request)
     if coach.status != ProfileStatus.APPROVED:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '仅审核通过的教练员可公示')
     # 已过期公示视为未公示，允许重新设置公示期
@@ -729,7 +745,7 @@ def publish_coach(request, pk: int, data=None) -> dict:
 
 @transaction.atomic
 def unpublish_coach(request, pk: int, data: dict) -> dict:
-    coach = _get_coach(pk, for_update=True)
+    coach = _get_coach(pk, for_update=True, request=request)
     if not _is_public_effective(coach.is_public, coach.public_end_at):
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员未公示')
     reason = data['reason'].strip()
@@ -748,7 +764,7 @@ def unpublish_coach(request, pk: int, data: dict) -> dict:
 
 @transaction.atomic
 def reset_coach_password(request, pk: int, data=None) -> dict:
-    coach = _get_coach(pk)
+    coach = _get_coach(pk, request=request)
     password = _reset_password_value(data)
     coach.user.set_password(password)
     coach.user.save(update_fields=['password'])
@@ -784,7 +800,7 @@ def batch_reset_coach_password(request, data: dict) -> dict:
 
 @transaction.atomic
 def restore_coach(request, pk: int) -> dict:
-    coach = _get_coach(pk, with_deleted=True)
+    coach = _get_coach(pk, with_deleted=True, request=request)
     if coach.deleted_at is None:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '该教练员未在归档中')
 
@@ -809,7 +825,7 @@ def restore_coach(request, pk: int) -> dict:
 
 @transaction.atomic
 def update_coach_account_status(request, pk: int, data: dict) -> dict:
-    coach = _get_coach(pk)
+    coach = _get_coach(pk, request=request)
     user = coach.user
     before = {'status': user.status, 'is_active': user.is_active}
 
@@ -841,14 +857,14 @@ def _objection_item(obj: CoachObjection) -> dict:
 
 @transaction.atomic
 def create_objection(request, coach_id: int, data: dict) -> dict:
-    coach = _get_coach(coach_id)
+    coach = _get_coach(coach_id, request=request)
     obj = CoachObjection.objects.create(coach=coach, **data)
     _log(request, '代录公示异议', 'coach', coach.id, None, _objection_item(obj))
     return _objection_item(obj)
 
 
 def list_objections(request, coach_id: int, params: dict) -> dict:
-    coach = _get_coach(coach_id)
+    coach = _get_coach(coach_id, request=request)
     qs = CoachObjection.objects.filter(coach=coach).order_by('-id')
     if 'handled' in params:
         qs = qs.filter(handled=params['handled'])
@@ -939,7 +955,7 @@ def _consumed_event_ids(player: AthleteProfile) -> set:
 
 def suspension_preview(request, pk: int) -> dict:
     """停赛提示：纯计算不落库。"""
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     events = _card_events(player)
     consumed = _consumed_event_ids(player)
     rule = _suspension_rules()
@@ -957,7 +973,7 @@ def suspension_preview(request, pk: int) -> dict:
 
 
 def list_suspensions(request, pk: int, params: dict) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     qs = PlayerSuspension.objects.filter(player=player).order_by('-id')
     if params.get('status'):
         qs = qs.filter(status=params['status'])
@@ -985,7 +1001,7 @@ def _create_suspension(player, reason, matches_count, source, events, start_at, 
 @transaction.atomic
 def generate_suspension(request, pk: int) -> dict:
     """按红黄牌累计自动生成停赛记录（幂等：已计入的事件不重复）。"""
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     events = _card_events(player)
     consumed = _consumed_event_ids(player)
     rule = _suspension_rules()
@@ -1019,7 +1035,7 @@ def generate_suspension(request, pk: int) -> dict:
 
 @transaction.atomic
 def create_manual_suspension(request, pk: int, data: dict) -> dict:
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     now = timezone.now()
     # 取消资格的球员不覆盖状态；否则仅首条生效停赛记录原状态
     if player.eligibility_status == EligibilityStatus.DISQUALIFIED:
@@ -1122,7 +1138,7 @@ def _active_team(team_id):
 
 @transaction.atomic
 def change_player_team(request, pk: int, data: dict) -> dict:
-    player = _get_player(pk, for_update=True)
+    player = _get_player(pk, for_update=True, request=request)
     from_team = player.team if player.team_id else None
     to_team = _active_team(data['team_id'])
     reason = data['reason'].strip()
@@ -1156,7 +1172,7 @@ def change_player_team(request, pk: int, data: dict) -> dict:
 
 
 def list_team_changes(request, pk: int, params: dict) -> dict:
-    player = _get_player(pk)
+    player = _get_player(pk, request=request)
     qs = (PlayerTeamChange.objects
           .filter(player=player)
           .select_related('from_team', 'to_team')
@@ -1192,8 +1208,8 @@ def _in_active_team(player: AthleteProfile) -> bool:
 
 @transaction.atomic
 def merge_players(request, data: dict) -> dict:
-    primary = _get_player(data['primary_id'], for_update=True)
-    duplicate = _get_player(data['duplicate_id'], for_update=True)
+    primary = _get_player(data['primary_id'], for_update=True, request=request)
+    duplicate = _get_player(data['duplicate_id'], for_update=True, request=request)
 
     if primary.id == duplicate.id:
         raise BusinessException(ResponseCode.BUSINESS_ERROR, '不能合并同一条档案')
@@ -1265,3 +1281,565 @@ def merge_players(request, data: dict) -> dict:
         'merged': True,
         'filled_fields': filled,
     }
+
+
+# ---------------------------------------------------------------------------
+# 阶段三：数据权限 scope（只读 / 写 统一走 apply_scope）
+# ---------------------------------------------------------------------------
+
+def apply_scope(qs, user, kind: str = 'player'):
+    """按用户 scope 过滤查询集。kind='player' 过滤 AthleteProfile，'coach' 过滤 CoachProfile。
+
+    - admin / superuser → 全量不过滤；
+    - province → 省下辖；
+    - city → 市下辖；
+    - school → 该校下属；
+    - 范围管理员没有配置对应 scope → 返回空（qs.none()）。
+
+    球员 scope 同时覆盖直挂 school 与挂 team 两种档案；
+    教练档案无 school/team 字段，通过反向 Team.teams 关联。
+    """
+    if user is None or user.is_superuser or user.role == UserRole.ADMIN:
+        return qs
+
+    # 教练：CoachProfile 通过 user.coached_teams 间接关联 Team → School
+    if kind == 'coach':
+        if user.role == UserRole.PROVINCE and user.scope_province_id:
+            return qs.filter(user__coached_teams__school__city__province=user.scope_province).distinct()
+        if user.role == UserRole.CITY and user.scope_city_id:
+            return qs.filter(user__coached_teams__school__city=user.scope_city).distinct()
+        if user.role == UserRole.SCHOOL and user.scope_school_id:
+            return qs.filter(user__coached_teams__school=user.scope_school).distinct()
+        return qs.none()
+
+    # 球员：同时覆盖直挂 school 与挂 team 两种档案
+    if user.role == UserRole.PROVINCE and user.scope_province_id:
+        return qs.filter(
+            Q(team__school__city__province=user.scope_province)
+            | Q(school__city__province=user.scope_province),
+        )
+    if user.role == UserRole.CITY and user.scope_city_id:
+        return qs.filter(
+            Q(team__school__city=user.scope_city) | Q(school__city=user.scope_city),
+        )
+    if user.role == UserRole.SCHOOL and user.scope_school_id:
+        return qs.filter(Q(team__school=user.scope_school) | Q(school=user.scope_school))
+    return qs.none()
+
+
+def _ensure_in_scope(user, profile, kind: str = 'player') -> None:
+    """写操作前的对象级 scope 校验：不在管辖范围 → 抛 403。"""
+    if user is None or user.is_superuser or user.role == UserRole.ADMIN:
+        return
+    if not apply_scope(profile.__class__.objects.filter(pk=profile.pk), user, kind).exists():
+        raise BusinessException(
+            ResponseCode.FORBIDDEN,
+            f'无权操作该{"球员" if kind == "player" else "教练员"}',
+            status_code=403,
+        )
+
+
+def _ensure_school_in_scope(user, school) -> None:
+    """新建球员 / 教练时校验 school 是否在操作者 scope 内。
+
+    - admin / superuser：不校验，允许 school=None（无学校直挂档案）；
+    - scope 角色（school / city / province）：school 必填，且必须在 scope 内；
+    - scope 角色未配置对应 scope 字段：直接 403；
+    - 范围角色 school=None：403（范围管理员不允许建无归属档案）。
+    """
+    if user is None or user.is_superuser or user.role == UserRole.ADMIN:
+        return
+
+    # 范围管理员不允许建无归属档案
+    if school is None:
+        raise BusinessException(
+            ResponseCode.FORBIDDEN,
+            '范围管理员必须指定学校',
+            status_code=403,
+        )
+
+    if user.role == UserRole.SCHOOL:
+        if not user.scope_school_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        if school.id != user.scope_school_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        return
+
+    # 提前 .select_related('city__province') 以防未预取
+    school = School.objects.select_related('city__province').get(pk=school.pk)
+
+    if user.role == UserRole.CITY:
+        if not user.scope_city_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        if school.city_id != user.scope_city_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        return
+
+    if user.role == UserRole.PROVINCE:
+        if not user.scope_province_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        if school.city.province_id != user.scope_province_id:
+            raise BusinessException(
+                ResponseCode.FORBIDDEN,
+                '无权在该学校创建球员',
+                status_code=403,
+            )
+        return
+
+    # 其他 role（personal / athlete / coach）理论上不会走到这里（被 ADMIN_OR_SCOPED 挡了）
+    raise BusinessException(
+        ResponseCode.FORBIDDEN,
+        '无权在该学校创建球员',
+        status_code=403,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 阶段三：批量导出（openpyxl + StreamingHttpResponse）
+# ---------------------------------------------------------------------------
+
+EXPORT_MAX_ROWS = 5000
+
+PLAYER_EXPORT_FIELDS = (
+    'school_name', 'grade', 'name', 'gender', 'position', 'jersey_no',
+    'height_cm', 'weight_kg', 'phone_masked', 'id_card_masked',
+    'status', 'eligibility_status', 'is_public', 'created_at',
+)
+COACH_EXPORT_FIELDS = (
+    'school_name', 'name', 'phone_masked', 'id_card_masked',
+    'qualification', 'status', 'is_public', 'created_at',
+)
+
+
+def _player_export_queryset(request, params):
+    qs = (AthleteProfile.objects
+          .select_related('team__school', 'school')
+          .order_by('created_at'))
+    qs = apply_scope(qs, request.user, kind='player')
+    if params.get('deleted'):
+        qs = qs.filter(deleted_at__isnull=False)
+    else:
+        qs = qs.filter(deleted_at__isnull=True)
+    if params.get('name'):
+        qs = qs.filter(name__icontains=params['name'])
+    if params.get('id_card'):
+        qs = qs.filter(id_card__iexact=params['id_card'])
+    if params.get('keyword'):
+        kw = params['keyword']
+        qs = qs.filter(Q(name__icontains=kw) | Q(id_card__icontains=kw))
+    return qs
+
+
+def _coach_export_queryset(request, params):
+    qs = CoachProfile.objects.prefetch_related('user__coached_teams__school').order_by('-created_at')
+    qs = apply_scope(qs, request.user, kind='coach')
+    if params.get('deleted'):
+        qs = qs.filter(deleted_at__isnull=False)
+    else:
+        qs = qs.filter(deleted_at__isnull=True)
+    if params.get('name'):
+        qs = qs.filter(name__icontains=params['name'])
+    return qs
+
+
+def _player_export_row(profile):
+    team = profile.team if profile.team_id else None
+    school = profile.school if profile.school_id else (team.school if team else None)
+    return [
+        school.name if school else '',
+        profile.grade or '',
+        profile.name or '',
+        profile.gender or '',
+        profile.position or '',
+        profile.jersey_no if profile.jersey_no is not None else '',
+        profile.height_cm if profile.height_cm is not None else '',
+        profile.weight_kg if profile.weight_kg is not None else '',
+        mask_phone(profile.user.phone or '') if profile.user_id else '',
+        mask_id_card(profile.id_card or '') if profile.id_card else '',
+        profile.get_status_display() if profile.status else '',
+        profile.get_eligibility_status_display() if profile.eligibility_status else '',
+        '是' if profile.is_public else '否',
+        format_dt(profile.created_at) if profile.created_at else '',
+    ]
+
+
+def _coach_export_row(profile):
+    team = profile.user.coached_teams.first() if profile.user_id else None
+    school = team.school if team else None
+    return [
+        school.name if school else '',
+        profile.name or '',
+        mask_phone(profile.user.phone or '') if profile.user_id else '',
+        mask_id_card(profile.id_card or '') if profile.id_card else '',
+        profile.qualification_path or '',
+        profile.get_status_display() if profile.status else '',
+        '是' if profile.is_public else '否',
+        format_dt(profile.created_at) if profile.created_at else '',
+    ]
+
+
+def _write_xlsx(headers, rows_iterable, title: str) -> io.BytesIO:
+    from openpyxl import Workbook  # 延迟导入，降低冷启动开销
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = title
+    ws.append(list(headers))
+    for row in rows_iterable:
+        ws.append(row)
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    return buffer
+
+
+def export_players(request, params: dict) -> StreamingHttpResponse:
+    qs = _player_export_queryset(request, params)
+    total = qs.count()
+    if total > EXPORT_MAX_ROWS:
+        raise BusinessException(
+            ResponseCode.BUSINESS_ERROR, f'导出超过{EXPORT_MAX_ROWS}行，请缩小筛选范围',
+        )
+
+    buffer = _write_xlsx(
+        PLAYER_EXPORT_FIELDS, (_player_export_row(p) for p in qs.iterator(chunk_size=2000)),
+        '球员名单',
+    )
+    filename = f'players_{date.today().strftime("%Y%m%d")}.xlsx'
+    # RFC 5987 兼容 UTF-8 文件名
+    disposition = (
+        f"attachment; filename=\"players.xlsx\"; "
+        f"filename*=UTF-8''{filename}"
+    )
+    resp = StreamingHttpResponse(
+        buffer,
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': disposition},
+    )
+    _log(request, '导出球员', 'player', 0, {'filename': filename}, {'count': total})
+    return resp
+
+
+def export_coaches(request, params: dict) -> StreamingHttpResponse:
+    qs = _coach_export_queryset(request, params)
+    total = qs.count()
+    if total > EXPORT_MAX_ROWS:
+        raise BusinessException(
+            ResponseCode.BUSINESS_ERROR, f'导出超过{EXPORT_MAX_ROWS}行，请缩小筛选范围',
+        )
+
+    buffer = _write_xlsx(
+        COACH_EXPORT_FIELDS, (_coach_export_row(c) for c in qs.iterator(chunk_size=2000)),
+        '教练员名单',
+    )
+    filename = f'coaches_{date.today().strftime("%Y%m%d")}.xlsx'
+    disposition = (
+        f"attachment; filename=\"coaches.xlsx\"; "
+        f"filename*=UTF-8''{filename}"
+    )
+    resp = StreamingHttpResponse(
+        buffer,
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': disposition},
+    )
+    _log(request, '导出教练员', 'coach', 0, {'filename': filename}, {'count': total})
+    return resp
+
+
+# ---------------------------------------------------------------------------
+# 阶段三：批量导入（openpyxl 读 xlsx）
+# ---------------------------------------------------------------------------
+
+IMPORT_MAX_ROWS = 500
+IMPORT_MAX_FILE_BYTES = 2 * 1024 * 1024  # 2 MB
+IMPORT_FAIL_ROLLBACK_RATIO = 0.8
+
+IMPORT_HEADERS = [
+    '姓名', '手机号', '身份证号', '学校名称', '年级',
+    '性别', '位置', '球衣号', '身高cm', '体重kg',
+]
+
+
+def import_template(request) -> StreamingHttpResponse:
+    """返回带表头 + 示例 + 必填说明的导入模板。"""
+    from openpyxl import Workbook
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = '球员导入模板'
+    ws.append(IMPORT_HEADERS)
+    ws.append([
+        '张三', '13800000001', '110101199003077758', '测试学校', '初二',
+        'male', '前锋', 10, 170, 60,
+    ])
+    ws.append([])
+    ws.append(['说明：前四列为必填；性别填 male/female；身高体重单位 cm/kg；身份证需校验位正确'])
+
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+    filename = f'players_import_template_{date.today().strftime("%Y%m%d")}.xlsx'
+    disposition = (
+        f"attachment; filename=\"players_import_template.xlsx\"; "
+        f"filename*=UTF-8''{filename}"
+    )
+    return StreamingHttpResponse(
+        buffer,
+        content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        headers={'Content-Disposition': disposition},
+    )
+
+
+def import_players(request, file) -> dict:
+    """导入球员 xlsx。逐行独立事务 + 单文件失败率>80% 整体回滚。"""
+    if file is None:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '未上传文件')
+    if file.size and file.size > IMPORT_MAX_FILE_BYTES:
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID, f'文件超过{IMPORT_MAX_FILE_BYTES // 1024 // 1024}MB',
+        )
+
+    from openpyxl import load_workbook
+
+    try:
+        wb = load_workbook(io.BytesIO(file.read()), read_only=True, data_only=True)
+    except Exception as exc:
+        raise BusinessException(ResponseCode.PARAM_INVALID, f'文件格式不合法: {exc}')
+
+    ws = wb.active
+    rows = list(ws.iter_rows(values_only=True))
+    if len(rows) <= 1:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '文件为空或只有表头')
+    body_rows = rows[1:]
+    if len(body_rows) > IMPORT_MAX_ROWS:
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID, f'单次最多导入{IMPORT_MAX_ROWS}行',
+        )
+
+    total = len(body_rows)
+    success_ids = []
+    failed = []
+    now = timezone.now()
+
+    for idx, row in enumerate(body_rows, start=2):  # Excel 行号从 1 起，跳过表头
+        try:
+            data = _parse_import_row(row)
+            with transaction.atomic():
+                # 用已有的 create_player 逻辑（但用 import_scope 里创建，
+                # 这里直接 inline 复用校验 + 新建）
+                _ensure_phone_available(data['phone'])
+                _ensure_id_card_available(data['id_card'], AthleteProfile, None)
+                school = _get_school_by_name(data['school_name'])
+                user = User.objects.create_user(
+                    username=data['phone'], phone=data['phone'],
+                    role=UserRole.ATHLETE, name=data['name'],
+                    password=settings.DEFAULT_RESET_PASSWORD,
+                )
+                profile = AthleteProfile.objects.create(
+                    user=user, name=data['name'], id_card=data['id_card'],
+                    school=school, gender=data.get('gender') or None,
+                    grade=data.get('grade') or None,
+                    position=data.get('position') or '',
+                    jersey_no=data.get('jersey_no'),
+                    height_cm=data.get('height_cm'),
+                    weight_kg=data.get('weight_kg'),
+                    status=ProfileStatus.PENDING,
+                )
+            success_ids.append(profile.id)
+        except BusinessException as exc:
+            failed.append({'row': idx, 'name': (row[0] or '')[:50], 'errors': [str(exc.msg)]})
+        except Exception as exc:  # pragma: no cover - 兜底
+            failed.append({'row': idx, 'name': (row[0] or '')[:50], 'errors': [f'{exc}']})
+
+    if total >= 3 and len(failed) / total > IMPORT_FAIL_ROLLBACK_RATIO:
+        # 整体回滚成功行，防误传（至少 3 行才判"整体有误"，避免单行文件全失败被过度回滚）
+        for pid in success_ids:
+            try:
+                profile = AthleteProfile.objects.get(pk=pid)
+                user = profile.user
+                user.delete()
+                profile.delete()
+            except AthleteProfile.DoesNotExist:
+                pass
+        _log(request, '批量导入球员', 'player', 0,
+             {'file': getattr(file, 'name', '')},
+             {'total': total, 'success': 0, 'failed': len(failed), 'rolled_back': True})
+        raise BusinessException(
+            ResponseCode.BUSINESS_ERROR,
+            f'失败行超过 80%，整体回滚，请检查文件内容后重试',
+        )
+
+    _log(request, '批量导入球员', 'player', 0,
+         {'file': getattr(file, 'name', '')},
+         {'total': total, 'success': len(success_ids), 'failed': len(failed)})
+    return {'total': total, 'success': len(success_ids), 'failed': failed}
+
+
+def _parse_import_row(row) -> dict:
+    from .serializers import validate_id_card  # 局部引入避免循环
+
+    name = str(row[0] or '').strip()
+    phone = str(row[1] or '').strip()
+    id_card_raw = str(row[2] or '').strip()
+    school_name = str(row[3] or '').strip()
+    grade = str(row[4] or '').strip() if len(row) > 4 else ''
+    gender = str(row[5] or '').strip() if len(row) > 5 else ''
+    position = str(row[6] or '').strip() if len(row) > 6 else ''
+    jersey_no = row[7] if len(row) > 7 else None
+    height_cm = row[8] if len(row) > 8 else None
+    weight_kg = row[9] if len(row) > 9 else None
+
+    if not name:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '姓名不能为空')
+    if not phone:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '手机号不能为空')
+    if not id_card_raw:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '身份证号不能为空')
+    if not school_name:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '学校名称不能为空')
+
+    import re
+    if not re.match(r'^1[3-9]\d{9}$', phone):
+        raise BusinessException(ResponseCode.PARAM_INVALID, '手机号格式不正确')
+
+    id_card = validate_id_card(id_card_raw)
+
+    if gender and gender not in ('male', 'female'):
+        raise BusinessException(ResponseCode.PARAM_INVALID, '性别仅支持 male / female')
+
+    def _int(value, field_name):
+        if value in (None, ''):
+            return None
+        try:
+            iv = int(float(value))
+        except (ValueError, TypeError):
+            raise BusinessException(ResponseCode.PARAM_INVALID, f'{field_name} 必须为整数')
+        if iv < 0:
+            raise BusinessException(ResponseCode.PARAM_INVALID, f'{field_name} 不能为负')
+        return iv
+
+    return {
+        'name': name, 'phone': phone, 'id_card': id_card, 'school_name': school_name,
+        'grade': grade or None,
+        'gender': gender or None,
+        'position': position or None,
+        'jersey_no': _int(jersey_no, '球衣号'),
+        'height_cm': _int(height_cm, '身高'),
+        'weight_kg': _int(weight_kg, '体重'),
+    }
+
+
+def _get_school_by_name(name: str) -> School:
+    school = School.objects.filter(name=name).first()
+    if school is None:
+        raise BusinessException(ResponseCode.PARAM_INVALID, f'学校不存在: {name}')
+    return school
+
+
+# ---------------------------------------------------------------------------
+# 阶段三：批量上传头像（多文件 multipart）
+# ---------------------------------------------------------------------------
+
+AVATAR_MAX_FILES = 50
+AVATAR_MAX_FILE_BYTES = 2 * 1024 * 1024
+AVATAR_ALLOWED_MIME = {'image/jpeg', 'image/png'}
+AVATAR_EXT_MAP = {'image/jpeg': '.jpg', 'image/png': '.png'}
+
+
+def _detect_image_mime(file) -> str | None:
+    """按文件头嗅探 MIME（不信任扩展名）。"""
+    header = file.read(12)
+    file.seek(0)
+    if header[:3] == b'\xff\xd8\xff':
+        return 'image/jpeg'
+    if header[:8] == b'\x89PNG\r\n\x1a\n':
+        return 'image/png'
+    return None
+
+
+def upload_avatars(request, files) -> dict:
+    if not files:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '未上传任何文件')
+    if len(files) > AVATAR_MAX_FILES:
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID, f'单次最多上传{AVATAR_MAX_FILES}个文件',
+        )
+
+    total = len(files)
+    success = 0
+    skipped = []
+
+    # 确保头像目录存在
+    avatar_dir = os.path.join(settings.MEDIA_ROOT, 'avatars')
+    os.makedirs(avatar_dir, exist_ok=True)
+
+    for f in files:
+        filename = f.name or ''
+        # 约定：{player_id}.jpg/png
+        stem, dot, _ext = filename.rpartition('.')
+        if not dot or not stem.isdigit():
+            skipped.append({'file': filename, 'reason': '文件名格式应为 {player_id}.jpg/png'})
+            continue
+        player_id = int(stem)
+
+        mime = _detect_image_mime(f)
+        if mime not in AVATAR_ALLOWED_MIME:
+            skipped.append({'file': filename, 'reason': '仅支持 jpg / png（按文件内容嗅探）'})
+            continue
+
+        if f.size and f.size > AVATAR_MAX_FILE_BYTES:
+            skipped.append({'file': filename, 'reason': f'单个文件超过{AVATAR_MAX_FILE_BYTES // 1024 // 1024}MB'})
+            continue
+
+        try:
+            profile = AthleteProfile.objects.get(pk=player_id, deleted_at__isnull=True)
+        except AthleteProfile.DoesNotExist:
+            skipped.append({'file': filename, 'reason': f'球员 {player_id} 不存在或已删除'})
+            continue
+
+        # 权限校验：文件对应的球员必须在当前用户 scope 内
+        if request.user.role not in ('admin',) and not request.user.is_superuser:
+            if not apply_scope(
+                AthleteProfile.objects.filter(pk=player_id), request.user, kind='player',
+            ).exists():
+                skipped.append({'file': filename, 'reason': '无权操作该球员'})
+                continue
+
+        ext = AVATAR_EXT_MAP[mime]
+        target_name = f'{player_id}{ext}'
+        target_path = os.path.join(avatar_dir, target_name)
+        # 覆盖旧文件
+        with open(target_path, 'wb+') as dest:
+            for chunk in f.chunks():
+                dest.write(chunk)
+
+        rel_path = f'avatars/{target_name}'
+        profile.avatar_path = rel_path
+        profile.updated_at = timezone.now()
+        profile.save(update_fields=['avatar_path', 'updated_at'])
+        success += 1
+
+    _log(request, '批量上传头像', 'player', 0,
+         {'files': [f.name for f in files]},
+         {'total': total, 'success': success, 'skipped': skipped})
+    return {'total': total, 'success': success, 'skipped': skipped}

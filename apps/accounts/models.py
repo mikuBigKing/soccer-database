@@ -60,6 +60,20 @@ class User(AbstractUser):
     status = models.CharField('账号状态', max_length=20, choices=UserStatus.choices, default=UserStatus.ACTIVE, db_index=True)
     permissions = models.JSONField('权限点', default=list, blank=True)
 
+    # 数据权限范围（阶段三）
+    scope_school = models.ForeignKey(
+        'org.School', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖学校',
+    )
+    scope_city = models.ForeignKey(
+        'org.City', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖城市',
+    )
+    scope_province = models.ForeignKey(
+        'org.Province', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖省份',
+    )
+
     class Meta:
         db_table = 'users'
         verbose_name = '用户'

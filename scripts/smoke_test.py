@@ -6,6 +6,7 @@
 import os
 import random
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -21,7 +22,7 @@ import django  # noqa: E402
 django.setup()
 
 from apps.accounts.models import AthleteProfile, User, UserRole  # noqa: E402
-from apps.live.models import Match, MatchStatus  # noqa: E402
+from apps.live.models import Match, MatchEvent, MatchStatus  # noqa: E402
 from apps.org.models import City, GroupType, School, Team, TeamStatus  # noqa: E402
 
 PASSED = []
@@ -39,9 +40,10 @@ def check(name: str, condition: bool, detail: str = ''):
 
 def api(method: str, path: str, token: str = None, **kwargs):
     headers = kwargs.pop('headers', {})
+    timeout = kwargs.pop('timeout', 15)
     if token:
         headers['Authorization'] = f'Bearer {token}'
-    response = requests.request(method, f'{BASE}{path}', headers=headers, timeout=15, **kwargs)
+    response = requests.request(method, f'{BASE}{path}', headers=headers, timeout=timeout, **kwargs)
     try:
         body = response.json()
     except ValueError:
@@ -99,12 +101,19 @@ def fixture():
         match_time='2026-10-28T15:00:00+08:00', venue='绵阳体育中心',
         status=MatchStatus.NOT_STARTED,
     )
-    return team, profile
+    pending_match = Match.objects.order_by('-id').first()
+    empty_match = Match.objects.create(
+        group_type=GroupType.MIDDLE_SCHOOL,
+        home_team_name='无事件主队', away_team_name='无事件客队',
+        match_time='2026-10-30T15:00:00+08:00',
+        status=MatchStatus.FINISHED,
+    )
+    return team, profile, pending_match, empty_match
 
 
 def main():
     print('== 0. 准备数据 ==')
-    team, profile = fixture()
+    team, profile, pending_match, empty_match = fixture()
     suffix = uuid.uuid4().hex[:6]
     phone = f'139{random.randint(10000000, 99999999)}'
 
@@ -360,7 +369,51 @@ def main():
     status, body = api('GET', '/api/admin/provinces', token=personal_token)
     check('个人不能访问管理端组织接口(20004)', body.get('code') == 20004, str(body)[:200])
 
-    print('== 11. 登出 ==')
+    print('== 11. 赛事报告 AI ==')
+    report_event, _ = MatchEvent.objects.get_or_create(
+        match_id=match_id, client_token=f'report-{suffix}',
+        defaults={'type': 'goal', 'minute': 12, 'team_side': 'home', 'player_no': '9', 'player_name': '王球员'},
+    )
+    # 直接插事件绕过比分联动，这里同步比分，避免报告里比分与事件矛盾
+    if report_event.type == 'goal' and report_event.team_side == 'home':
+        Match.objects.filter(pk=match_id).update(home_score=1)
+
+    status, body = api('GET', f'/api/public/live/matches/{match_id}/report')
+    check('报告未生成返回 pending', body.get('code') == 0 and body.get('data', {}).get('status') == 'pending',
+          str(body)[:200])
+
+    status, body = api('POST', f'/api/admin/live/matches/{match_id}/report', token=admin_token, json={}, timeout=90)
+    data = body.get('data') or {}
+    check('生成报告成功', body.get('code') == 0 and data.get('status') == 'succeeded', str(body)[:200])
+    report = data.get('report') or {}
+    check('报告字段齐全', all(k in report for k in ('narrative', 'chapters', 'key_moments', 'highlights', 'confidence')),
+          str(report)[:200])
+    check('置信度 0-100', isinstance(report.get('confidence'), int) and 0 <= report['confidence'] <= 100,
+          str(report.get('confidence')))
+    check('分组标签为中文', data.get('match', {}).get('group_type_label') == '中学组', str(data.get('match'))[:200])
+    generated_at = data.get('generated_at')
+
+    status, body = api('POST', f'/api/admin/live/matches/{match_id}/report', token=admin_token, json={})
+    check('重复生成幂等', body.get('data', {}).get('generated_at') == generated_at, str(body)[:200])
+
+    time.sleep(1.1)  # generated_at 精确到秒，等待以区分两次生成
+    status, body = api('POST', f'/api/admin/live/matches/{match_id}/report', token=admin_token, json={'force': True}, timeout=90)
+    check('force 重新生成', body.get('data', {}).get('status') == 'succeeded'
+          and body.get('data', {}).get('generated_at') != generated_at, str(body)[:200])
+
+    status, body = api('GET', f'/api/public/live/matches/{match_id}/report')
+    check('公众端可读报告', body.get('code') == 0 and body.get('data', {}).get('status') == 'succeeded', str(body)[:200])
+
+    status, body = api('POST', f'/api/admin/live/matches/{pending_match.pk}/report', token=admin_token, json={})
+    check('未结束禁止生成(40002)', body.get('code') == 40002, str(body)[:200])
+
+    status, body = api('POST', f'/api/admin/live/matches/{empty_match.pk}/report', token=admin_token, json={})
+    check('无事件禁止生成(40001)', body.get('code') == 40001, str(body)[:200])
+
+    status, body = api('POST', f'/api/admin/live/matches/{match_id}/report', token=personal_token, json={})
+    check('个人角色不可生成(20004)', body.get('code') == 20004, str(body)[:200])
+
+    print('== 12. 登出 ==')
     status, body = api('POST', '/api/auth/logout', token=admin_token)
     check('登出', body.get('code') == 0, str(body)[:200])
 

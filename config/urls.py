@@ -3,6 +3,7 @@
 - /api/auth/*            注册 / 统一登录 / 管理员登录 / 登出 / me
 - /api/public/live/*     赛事直播公众端（免登）
 - /api/admin/live/*      赛事直播管理端（登录 + 权限点）
+- /api/*/matches/*/report 赛事报告（公众端免登 / 管理端 admin+province）
 - /api/admin/*           行政区划/城市/学校（管理员）
 - /api/city/*            市级查阅
 - /api/athlete/*         运动员端
@@ -20,6 +21,8 @@ urlpatterns = [
     path('api/', include('apps.accounts.urls')),
     path('api/public/live/', include('apps.live.urls_public')),
     path('api/admin/live/', include('apps.live.urls_admin')),
+    path('api/public/live/', include('apps.report.urls_public')),
+    path('api/admin/live/', include('apps.report.urls_admin')),
     path('api/admin/', include('apps.org.urls')),
     path('api/admin/', include('apps.admin_console.urls')),
     path('api/', include('apps.org.urls_city')),

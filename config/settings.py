@@ -44,6 +44,7 @@ INSTALLED_APPS = [
     'apps.athlete',
     'apps.registration',
     'apps.admin_console',
+    'apps.report',
 ]
 
 MIDDLEWARE = [
@@ -179,3 +180,18 @@ LOGGING = {
         'api': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
     },
 }
+
+# ---------------------------------------------------------------------------
+# 赛事报告 AI（Qwen3 / OpenAI 兼容端点）
+# ---------------------------------------------------------------------------
+REPORT_ENABLED = os.getenv('REPORT_ENABLED', '1') == '1'
+REPORT_LLM_BASE_URL = os.getenv('REPORT_LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+REPORT_LLM_API_KEY = os.getenv('REPORT_LLM_API_KEY', '')
+REPORT_LLM_MODEL = os.getenv('REPORT_LLM_MODEL', 'qwen3-max')
+REPORT_LLM_TIMEOUT = int(os.getenv('REPORT_LLM_TIMEOUT', '60'))
+REPORT_LLM_TEMPERATURE = float(os.getenv('REPORT_LLM_TEMPERATURE', '0.3'))
+REPORT_LLM_MAX_TOKENS = int(os.getenv('REPORT_LLM_MAX_TOKENS', '2000'))
+# Qwen3 思考模式会产生大量 reasoning token（实测同一场报告 338s / 3688 tokens），生产默认关闭
+REPORT_LLM_DISABLE_THINKING = os.getenv('REPORT_LLM_DISABLE_THINKING', '1') == '1'
+# 未配置 API Key 时自动走 mock，保证本地与 CI 可用
+REPORT_LLM_MOCK = os.getenv('REPORT_LLM_MOCK', '1' if not REPORT_LLM_API_KEY else '0') == '1'

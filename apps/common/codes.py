@@ -38,6 +38,7 @@ class ResponseCode(IntEnum):
 
     # 500xx 外部服务
     FACE_VERIFY_FAILED = 50008
+    AI_SERVICE_FAILED = 50009
 
     # 600xx 存储
     DB_ERROR = 60001
@@ -61,6 +62,7 @@ MESSAGES = {
     ResponseCode.MATCH_FINISHED_LOCKED: '比赛已结束，禁止修改',
     ResponseCode.DUPLICATE_SUBMIT: '请勿重复提交',
     ResponseCode.FACE_VERIFY_FAILED: '人脸核验服务异常',
+    ResponseCode.AI_SERVICE_FAILED: 'AI 报告生成服务异常，请稍后重试',
     ResponseCode.DB_ERROR: '数据存储异常',
     ResponseCode.SYSTEM_ERROR: '系统繁忙，请稍后重试',
 }

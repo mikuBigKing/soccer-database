@@ -358,7 +358,9 @@ def update_player(request, pk: int, data: dict) -> dict:
         _ensure_id_card_available(data['id_card'], AthleteProfile, player.pk)
     if 'school_id' in data:
         school_id = data['school_id']
-        player.school = _get_school(school_id) if school_id else None
+        school = _get_school(school_id) if school_id else None
+        _ensure_school_in_scope(request.user, school, action='transfer')
+        player.school = school
         changed.append('school')
     for source, target in field_map.items():
         if source in data:
@@ -1141,6 +1143,7 @@ def change_player_team(request, pk: int, data: dict) -> dict:
     player = _get_player(pk, for_update=True, request=request)
     from_team = player.team if player.team_id else None
     to_team = _active_team(data['team_id'])
+    _ensure_team_in_scope(request.user, to_team)
     reason = data['reason'].strip()
 
     # 噪音变更拦截：换同队、空队解绑
@@ -1339,18 +1342,22 @@ def _ensure_in_scope(user, profile, kind: str = 'player') -> None:
         )
 
 
-def _ensure_school_in_scope(user, school) -> None:
-    """新建球员 / 教练时校验 school 是否在操作者 scope 内。
+def _ensure_school_in_scope(user, school, action: str = 'create') -> None:
+    """校验 school 是否在操作者 scope 内。
 
     - admin / superuser：不校验，允许 school=None（无学校直挂档案）；
     - scope 角色（school / city / province）：school 必填，且必须在 scope 内；
     - scope 角色未配置对应 scope 字段：直接 403；
-    - 范围角色 school=None：403（范围管理员不允许建无归属档案）。
+    - 范围角色 school=None：403（范围管理员不允许建无归属档案或把学校置空）。
+
+    action='create' 时文案为「无权在该学校创建球员」；
+    action='transfer' 时文案为「无权将该球员变更到该学校」。
     """
+    label = '无权在该学校创建球员' if action == 'create' else '无权将该球员变更到该学校'
     if user is None or user.is_superuser or user.role == UserRole.ADMIN:
         return
 
-    # 范围管理员不允许建无归属档案
+    # 范围管理员不允许建无归属档案 / 把学校置空
     if school is None:
         raise BusinessException(
             ResponseCode.FORBIDDEN,
@@ -1360,17 +1367,9 @@ def _ensure_school_in_scope(user, school) -> None:
 
     if user.role == UserRole.SCHOOL:
         if not user.scope_school_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         if school.id != user.scope_school_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         return
 
     # 提前 .select_related('city__province') 以防未预取
@@ -1378,40 +1377,67 @@ def _ensure_school_in_scope(user, school) -> None:
 
     if user.role == UserRole.CITY:
         if not user.scope_city_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         if school.city_id != user.scope_city_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         return
 
     if user.role == UserRole.PROVINCE:
         if not user.scope_province_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         if school.city.province_id != user.scope_province_id:
-            raise BusinessException(
-                ResponseCode.FORBIDDEN,
-                '无权在该学校创建球员',
-                status_code=403,
-            )
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
         return
 
     # 其他 role（personal / athlete / coach）理论上不会走到这里（被 ADMIN_OR_SCOPED 挡了）
-    raise BusinessException(
-        ResponseCode.FORBIDDEN,
-        '无权在该学校创建球员',
-        status_code=403,
-    )
+    raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+
+
+def _ensure_team_in_scope(user, team) -> None:
+    """校验 team 是否在操作者 scope 内。
+
+    - admin / superuser：不校验，允许 team=None（解绑球队）；
+    - scope 角色（school / city / province）：team 必填，且 team.school 必须在 scope 内；
+    - scope 角色未配置对应 scope 字段：直接 403；
+    - 范围角色 team=None：403（解绑后球员脱离所有人的管辖范围，与置空学校同理）。
+    """
+    if user is None or user.is_superuser or user.role == UserRole.ADMIN:
+        return
+
+    # 范围管理员不允许解绑球队（会导致球员脱离所有人管辖）
+    if team is None:
+        raise BusinessException(
+            ResponseCode.FORBIDDEN,
+            '范围管理员必须指定目标球队',
+            status_code=403,
+        )
+
+    # 提前预取 team.school.city.province
+    team = Team.objects.select_related('school__city__province').get(pk=team.pk)
+    label = '无权将该球员变更到该球队'
+
+    if user.role == UserRole.SCHOOL:
+        if not user.scope_school_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        if team.school_id != user.scope_school_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        return
+
+    if user.role == UserRole.CITY:
+        if not user.scope_city_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        if team.school.city_id != user.scope_city_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        return
+
+    if user.role == UserRole.PROVINCE:
+        if not user.scope_province_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        if team.school.city.province_id != user.scope_province_id:
+            raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
+        return
+
+    raise BusinessException(ResponseCode.FORBIDDEN, label, status_code=403)
 
 
 # ---------------------------------------------------------------------------

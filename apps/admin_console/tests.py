@@ -2508,3 +2508,175 @@ class ScopeExtraCoverageTest(BaseAdminData):
         self.assertIn('****', first[8])  # phone_masked 脱敏
         self.assertIn('****', first[9])  # id_card_masked 脱敏
 
+
+# ---------------------------------------------------------------------------
+# 数据权限绕过修复：改学校 / 换队未校验目标归属
+# ---------------------------------------------------------------------------
+
+class ScopeTransferTest(BaseAdminData):
+    """修复漏洞 1 & 2：scope 管理员改学校 / 换队必须校验目标归属。"""
+
+    @classmethod
+    def setUpTestData(cls):
+        from apps.accounts.models import UserRole
+        super().setUpTestData()
+        # 外省 / 外市 / 外校 / 外队
+        cls.other_province = Province.objects.create(name='外省', code='220000')
+        cls.other_city = City.objects.create(province=cls.other_province, name='外市', code='220100')
+        cls.other_school = School.objects.create(city=cls.other_city, name='外省外校')
+        cls.other_team = Team.objects.create(
+            school=cls.other_school, name='外省外队',
+            coach=cls.coach2_user, group_type=GroupType.MIDDLE_SCHOOL,
+        )
+        # 本市另一所学校 + 球队
+        cls.same_city_school = School.objects.create(city=cls.school.city, name='本市他校')
+        cls.same_city_team = Team.objects.create(
+            school=cls.same_city_school, name='本市他队',
+            coach=cls.coach3_user, group_type=GroupType.MIDDLE_SCHOOL,
+        )
+
+        cls.school_admin = User.objects.create_user(
+            username='school_transfer', role=UserRole.SCHOOL, phone='13900000030',
+            name='校级管理员', password=PASSWORD,
+        )
+        cls.school_admin.scope_school = cls.school
+        cls.school_admin.save()
+
+        cls.city_admin = User.objects.create_user(
+            username='city_transfer', role=UserRole.CITY, phone='13900000031',
+            name='市级管理员', password=PASSWORD,
+        )
+        cls.city_admin.scope_city = cls.school.city
+        cls.city_admin.save()
+
+        # 把 p2 挂到 cls.school 上（方便 scope 管理员操作）
+        cls.p2.school = cls.school
+        cls.p2.save()
+
+    def setUp(self):
+        super().setUp()
+        self.school_client = auth_client(self.school_admin)
+        self.city_client = auth_client(self.city_admin)
+
+    # ---------- 漏洞 1：school 管理员改学校到外校 → 403 ----------
+
+    def test_school_admin_change_school_to_other_scope_403(self):
+        """school 管理员把本校球员 school_id 改到外校 → 403 + 20004。"""
+        resp = self.school_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': self.other_school.id,
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+        # 球员 school 未变
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.school_id, self.school.id)
+
+    # ---------- 漏洞 2：school 管理员换队到外校球队 → 403 ----------
+
+    def test_school_admin_change_team_to_other_scope_403(self):
+        """school 管理员把本校球员换到外校球队 → 403 + 20004。"""
+        resp = self.school_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': self.other_team.id, 'reason': '测试越权',
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+        # 球员 team 未变
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.team_id, self.team.id)
+
+    # ---------- 漏洞 2 补充：scope 角色解绑球队 → 403 ----------
+
+    def test_school_admin_unbind_team_403(self):
+        """school 管理员解绑本校球员球队（team_id=null）→ 403。"""
+        resp = self.school_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': None, 'reason': '解绑',
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+
+    # ---------- 漏洞 1 补充：scope 角色把 school 置空 → 403 ----------
+
+    def test_school_admin_clear_school_403(self):
+        """school 管理员把球员 school_id 置空 → 403。"""
+        resp = self.school_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': None,
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+
+    # ---------- 正向用例：city 管理员在本市两所学校之间改学校 → 成功 ----------
+
+    def test_city_admin_change_school_same_city_ok(self):
+        """city 管理员把本市球员改到本市另一所学校 → 成功。"""
+        resp = self.city_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': self.same_city_school.id,
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+        self.p2.refresh_from_db()
+        self.assertEqual(self.p2.school_id, self.same_city_school.id)
+
+    # ---------- 正向用例：city 管理员在本市换队 → 成功 ----------
+
+    def test_city_admin_change_team_same_city_ok(self):
+        """city 管理员把本市球员换到本市另一支球队 → 成功。"""
+        resp = self.city_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': self.same_city_team.id, 'reason': '市管换队',
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+        self.p1.refresh_from_db()
+        self.assertEqual(self.p1.team_id, self.same_city_team.id)
+
+    # ---------- city 管理员改到外市学校 / 换到外市球队 → 403 ----------
+
+    def test_city_admin_change_school_other_city_403(self):
+        """city 管理员把本市球员改到外市学校 → 403。"""
+        resp = self.city_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': self.other_school.id,
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+
+    def test_city_admin_change_team_other_city_403(self):
+        """city 管理员把本市球员换到外市球队 → 403。"""
+        resp = self.city_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': self.other_team.id, 'reason': '测试越权',
+        }, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(resp.json()['code'], 20004)
+
+    # ---------- admin 改学校 / 换队 / 置空 / 解绑 → 不受影响（回归） ----------
+
+    def test_admin_change_school_across_scope_ok(self):
+        """admin 把球员改到外市学校 → 成功。"""
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': self.other_school.id,
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+
+    def test_admin_change_team_across_scope_ok(self):
+        """admin 把球员换到外市球队 → 成功。"""
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': self.other_team.id, 'reason': 'admin操作',
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+
+    def test_admin_clear_school_ok(self):
+        """admin 把球员 school_id 置空 → 成功。"""
+        resp = self.admin_client.put(f'/api/admin/players/{self.p2.id}', {
+            'school_id': None,
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+
+    def test_admin_unbind_team_ok(self):
+        """admin 解绑球队（team_id=null）→ 成功。"""
+        resp = self.admin_client.put(f'/api/admin/players/{self.p1.id}/team', {
+            'team_id': None, 'reason': 'admin解绑',
+        }, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['code'], 0)
+

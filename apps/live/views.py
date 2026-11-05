@@ -10,7 +10,9 @@ from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.pagination import paginate
 from apps.common.permissions import live_permission
+from apps.org.models import GroupType
 
+from . import leaderboard
 from .models import EventType, Match, MatchFile, MatchStatus
 from .serializers import (
     AdminMatchDetailSerializer,
@@ -27,6 +29,7 @@ from .serializers import (
     MatchListSerializer,
     MatchStatusSerializer,
     MatchStoreSerializer,
+    ManualScoreSerializer,
     MatchUpdateSerializer,
     RefereeSerializer,
     RefereesSerializer,
@@ -120,6 +123,21 @@ class PublicMatchEventListView(APIView):
         return Response(MatchEventSerializer(queryset, many=True).data)
 
 
+class PublicLeaderboardView(APIView):
+    """公众端榜单：选手进球榜 / 分组进球统计 / 球队进球榜。"""
+
+    def get(self, request):
+        group_type = request.query_params.get('group_type') or None
+        if group_type and group_type not in GroupType.values:
+            raise BusinessException(ResponseCode.PARAM_INVALID, 'group_type 取值不合法')
+        try:
+            limit = int(request.query_params.get('limit') or 10)
+        except (TypeError, ValueError):
+            raise BusinessException(ResponseCode.PARAM_INVALID, 'limit 必须为整数')
+        limit = max(1, min(limit, 50))
+        return Response(leaderboard.payload(group_type, limit))
+
+
 # ---------------------------------------------------------------------------
 # 管理端
 # ---------------------------------------------------------------------------
@@ -192,6 +210,20 @@ class AdminMatchStatusView(APIView):
             serializer.validated_data['version'],
             request.user.id,
         )
+        return Response(AdminMatchDetailSerializer(match).data)
+
+
+class AdminMatchScoreView(APIView):
+    """人工补报比分：网关/厂商链路异常时兜底，落库后来源标记 manual。"""
+
+    permission_classes = [live_permission('live:match:update')]
+
+    def post(self, request, pk: int):
+        serializer = ManualScoreSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = dict(serializer.validated_data)
+        version = data.pop('version')
+        match = MatchService().update_score(_get_match(pk), data, version, request.user.id)
         return Response(AdminMatchDetailSerializer(match).data)
 
 

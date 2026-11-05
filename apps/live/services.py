@@ -6,11 +6,15 @@ MatchFileService / FaceVerifyService）。
 - 乐观锁：update 类操作以 version 为条件，影响行数为 0 抛 code=9
 - 事件：client_token 幂等（40009）；goal 事件在锁内联动比分
 """
+import hashlib
+import hmac
 import logging
 import os
+import time
 import uuid
 
 from django.conf import settings
+from django.core.cache import cache
 from django.db import transaction
 from django.utils import timezone
 
@@ -20,12 +24,16 @@ from apps.common.exceptions import BusinessException
 from .models import (
     EventType,
     FaceVerifyRecord,
+    LiveDevice,
+    LiveScoreFeed,
     Match,
     MatchEvent,
     MatchFile,
     MatchReferee,
+    MatchStage,
     MatchStatus,
     RefereeRole,
+    ScoreSource,
 )
 
 business_logger = logging.getLogger('business')
@@ -83,6 +91,43 @@ class MatchService:
         business_logger.info(
             'match status changed match_id=%s operator=%s before=%s after=%s',
             match.pk, user_id, from_status, to_status,
+        )
+        if to_status == MatchStatus.FINISHED:
+            from .leaderboard import invalidate
+
+            invalidate()
+        return Match.objects.get(pk=match.pk)
+
+    def update_score(self, match: Match, data: dict, version: int, user_id: int) -> Match:
+        """人工补报比分：网关/厂商链路异常时兜底，来源标记 manual，允许修正回退。"""
+        self._ensure_editable(match)
+
+        payload = {
+            'home_score': data['home_score'],
+            'away_score': data['away_score'],
+            'score_source': ScoreSource.MANUAL,
+            'updated_by': user_id,
+            'version': version + 1,
+        }
+        stage = data.get('stage')
+        if stage:
+            payload['stage'] = stage
+            payload['status'] = STAGE_TO_STATUS.get(stage, MatchStatus.LIVE)
+        if data.get('clock_minute') is not None:
+            payload['clock_minute'] = data['clock_minute']
+
+        with transaction.atomic():
+            affected = Match.objects.filter(pk=match.pk, version=version).update(**payload)
+            if affected == 0:
+                raise BusinessException(ResponseCode.OPTIMISTIC_LOCK_CONFLICT)
+
+        if payload.get('status') == MatchStatus.FINISHED:
+            from .leaderboard import invalidate
+
+            invalidate()
+        business_logger.info(
+            'match score manually updated match_id=%s operator=%s score=%s-%s stage=%s',
+            match.pk, user_id, payload['home_score'], payload['away_score'], payload.get('stage', '-'),
         )
         return Match.objects.get(pk=match.pk)
 
@@ -294,3 +339,149 @@ class FaceVerifyService:
             record.id, match.pk, user_id, result,
         )
         return record
+
+
+# ---------------------------------------------------------------------------
+# 计分网关：设备鉴权 + 比分/阶段上报
+# ---------------------------------------------------------------------------
+STAGE_TO_STATUS = {
+    MatchStage.NOT_STARTED: MatchStatus.NOT_STARTED,
+    MatchStage.FIRST_HALF: MatchStatus.LIVE,
+    MatchStage.HALF_TIME: MatchStatus.LIVE,
+    MatchStage.SECOND_HALF: MatchStatus.LIVE,
+    MatchStage.EXTRA_TIME: MatchStatus.LIVE,
+    MatchStage.PENALTY: MatchStatus.LIVE,
+    MatchStage.FINISHED: MatchStatus.FINISHED,
+}
+
+
+class DeviceAuthService:
+    """网关签名校验：X-Device-Id / X-Timestamp / X-Nonce / X-Sign。"""
+
+    CLOCK_SKEW = 300
+    NONCE_TTL = 300
+
+    def authenticate(self, request) -> LiveDevice:
+        device_no = (request.headers.get('X-Device-Id') or '').strip()
+        timestamp = (request.headers.get('X-Timestamp') or '').strip()
+        nonce = (request.headers.get('X-Nonce') or '').strip()
+        signature = (request.headers.get('X-Sign') or '').strip().lower()
+        if not device_no or not timestamp or not nonce or not signature:
+            raise BusinessException(ResponseCode.FORBIDDEN, '设备鉴权信息缺失')
+
+        device = LiveDevice.objects.filter(device_no=device_no).first()
+        if device is None or not device.enabled:
+            raise BusinessException(ResponseCode.FORBIDDEN, '设备不存在或已停用')
+
+        try:
+            reported = int(timestamp)
+        except (TypeError, ValueError):
+            raise BusinessException(ResponseCode.FORBIDDEN, '请求已过期')
+        if abs(time.time() - reported) > self.CLOCK_SKEW:
+            raise BusinessException(ResponseCode.FORBIDDEN, '请求已过期')
+
+        nonce_key = 'live:device:nonce:%s:%s' % (device_no, nonce)
+        if not cache.add(nonce_key, 1, self.NONCE_TTL):
+            raise BusinessException(ResponseCode.FORBIDDEN, '请求已过期')
+
+        body = request.body or b''
+        body_hash = hashlib.sha256(body).hexdigest()
+        sign_str = '%s\n%s\n%s\n%s\n%s' % (request.method, request.path, timestamp, nonce, body_hash)
+        expected = hmac.new(device.secret.encode('utf-8'), sign_str.encode('utf-8'), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, signature):
+            raise BusinessException(ResponseCode.FORBIDDEN, '签名校验失败')
+
+        device.last_seen_at = timezone.now()
+        device.save(update_fields=['last_seen_at'])
+        return device
+
+
+class ScoreboardService:
+    """计分板上报落库：只更新比分与阶段，不生成进球事件。"""
+
+    def apply(self, device: LiveDevice, payload: dict) -> dict:
+        seq = payload['seq']
+        match_id = payload.get('match_id') or device.match_id
+        if not match_id:
+            raise BusinessException(ResponseCode.BUSINESS_ERROR, '设备未绑定比赛且报文未带 match_id')
+        if device.match_id and payload.get('match_id') and int(payload['match_id']) != device.match_id:
+            raise BusinessException(ResponseCode.BUSINESS_ERROR, '报文比赛与设备绑定不一致')
+
+        try:
+            with transaction.atomic():
+                match = Match.objects.select_for_update().filter(pk=match_id).first()
+                if match is None:
+                    raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在')
+                if seq <= device.last_seq:
+                    if LiveScoreFeed.objects.filter(device=device, match=match, seq=seq).exists():
+                        raise BusinessException(ResponseCode.DUPLICATE_SUBMIT)
+                    raise BusinessException(ResponseCode.SEQ_OUT_OF_ORDER)
+                if match.status == MatchStatus.FINISHED:
+                    raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED)
+                if payload['home_score'] < match.home_score or payload['away_score'] < match.away_score:
+                    raise BusinessException(ResponseCode.BUSINESS_ERROR, '比分不可回退，请人工修正')
+
+                stage = payload['stage']
+                clock_minute = payload.get('clock_minute') or 0
+                LiveScoreFeed.objects.update_or_create(
+                    device=device,
+                    match=match,
+                    seq=seq,
+                    defaults={
+                        'payload': dict(payload),
+                        'applied': True,
+                        'error': '',
+                        'reported_at': payload.get('reported_at'),
+                    },
+                )
+                match.home_score = payload['home_score']
+                match.away_score = payload['away_score']
+                match.stage = stage
+                match.clock_minute = clock_minute
+                match.score_source = ScoreSource.DEVICE
+                match.status = STAGE_TO_STATUS.get(stage, MatchStatus.LIVE)
+                match.version += 1
+                match.save()
+
+                device.last_seq = seq
+                device.last_seen_at = timezone.now()
+                device.save(update_fields=['last_seq', 'last_seen_at'])
+
+                if match.status == MatchStatus.FINISHED:
+                    from .leaderboard import invalidate
+
+                    invalidate()
+        except BusinessException as exc:
+            self._log_reject(device, match_id, payload, exc.msg)
+            raise
+
+        business_logger.info(
+            'scoreboard applied device=%s match_id=%s seq=%s score=%s-%s stage=%s',
+            device.device_no, match.pk, seq, match.home_score, match.away_score, match.stage,
+        )
+        return {
+            'match_id': match.pk,
+            'seq': seq,
+            'home_score': match.home_score,
+            'away_score': match.away_score,
+            'stage': match.stage,
+            'status': match.status,
+            'ack': 'ok',
+        }
+
+    @staticmethod
+    def _log_reject(device: LiveDevice, match_id, payload: dict, error: str) -> None:
+        match = Match.all_objects.filter(pk=match_id).first()
+        if match is None:
+            return
+        LiveScoreFeed.objects.get_or_create(
+            device=device,
+            match=match,
+            seq=payload.get('seq') or 0,
+            defaults={
+                'payload': dict(payload),
+                'applied': False,
+                'error': (error or '')[:200],
+                'reported_at': payload.get('reported_at'),
+            },
+        )

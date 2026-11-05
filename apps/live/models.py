@@ -12,6 +12,26 @@ class MatchStatus(models.TextChoices):
     FINISHED = 'finished', '已结束'
 
 
+class MatchStage(models.TextChoices):
+    """比赛阶段（本域网关与厂商接口共用）。"""
+
+    NOT_STARTED = 'not_started', '未开始'
+    FIRST_HALF = 'first_half', '上半场'
+    HALF_TIME = 'half_time', '中场'
+    SECOND_HALF = 'second_half', '下半场'
+    EXTRA_TIME = 'extra_time', '加时'
+    PENALTY = 'penalty', '点球'
+    FINISHED = 'finished', '完场'
+
+
+class ScoreSource(models.TextChoices):
+    """比分来源，异常时可追溯。"""
+
+    MANUAL = 'manual', '人工上报'
+    DEVICE = 'device', '本域网关'
+    VENDOR = 'vendor', '厂商接口'
+
+
 class EventType(models.TextChoices):
     GOAL = 'goal', '进球'
     YELLOW = 'yellow', '黄牌'
@@ -62,6 +82,9 @@ class Match(models.Model):
     status = models.CharField('状态', max_length=16, choices=MatchStatus.choices, default=MatchStatus.NOT_STARTED)
     home_score = models.PositiveSmallIntegerField('主队比分', default=0)
     away_score = models.PositiveSmallIntegerField('客队比分', default=0)
+    stage = models.CharField('比赛阶段', max_length=16, choices=MatchStage.choices, default=MatchStage.NOT_STARTED)
+    clock_minute = models.PositiveSmallIntegerField('比赛时钟(分钟)', default=0)
+    score_source = models.CharField('比分来源', max_length=8, choices=ScoreSource.choices, default=ScoreSource.MANUAL)
     lineup_home = models.JSONField('主队阵容', null=True, blank=True)
     lineup_away = models.JSONField('客队阵容', null=True, blank=True)
     live_link = models.CharField('直播链接', max_length=512, null=True, blank=True)
@@ -170,3 +193,46 @@ class FaceVerifyRecord(models.Model):
     class Meta:
         db_table = 'face_verify_records'
         ordering = ['-id']
+
+
+class LiveDevice(models.Model):
+    """现场计分网关设备：HMAC 密钥 + 默认绑定比赛 + seq 游标。"""
+
+    device_no = models.CharField('设备编号', max_length=32, unique=True)
+    name = models.CharField('设备名称', max_length=64, blank=True, default='')
+    secret = models.CharField('上报密钥', max_length=64)
+    match = models.ForeignKey(
+        Match, null=True, blank=True, on_delete=models.SET_NULL, related_name='devices'
+    )
+    enabled = models.BooleanField('启用', default=True)
+    last_seq = models.BigIntegerField('已接受的最大序号', default=0)
+    last_seen_at = models.DateTimeField('最近上报时间', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'live_devices'
+        ordering = ['-id']
+
+    def __str__(self):
+        return self.device_no
+
+
+class LiveScoreFeed(models.Model):
+    """计分板原始报文留痕（成功与失败都记，便于现场排查）。"""
+
+    device = models.ForeignKey(LiveDevice, on_delete=models.CASCADE, related_name='feeds')
+    match = models.ForeignKey(Match, on_delete=models.CASCADE, related_name='score_feeds')
+    seq = models.BigIntegerField('报文序号')
+    payload = models.JSONField('原始报文', default=dict)
+    applied = models.BooleanField('是否生效', default=False)
+    error = models.CharField('失败原因', max_length=200, blank=True, default='')
+    reported_at = models.DateTimeField('设备上报时间', null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'live_score_feeds'
+        ordering = ['-id']
+        constraints = [
+            models.UniqueConstraint(fields=['device', 'match', 'seq'], name='uniq_score_feed_seq'),
+        ]
+        indexes = [models.Index(fields=['match', '-created_at'])]

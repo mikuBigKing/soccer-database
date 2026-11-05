@@ -13,6 +13,7 @@ from .views import (
     AdminMatchFileView,
     AdminMatchLineupView,
     AdminMatchListCreateView,
+    AdminMatchScoreView,
     AdminMatchStatusView,
     AdminRefereeView,
 )
@@ -22,6 +23,7 @@ urlpatterns = [
     path('matches', AdminMatchListCreateView.as_view()),
     path('matches/<int:pk>', AdminMatchDetailView.as_view()),
     path('matches/<int:pk>/status', AdminMatchStatusView.as_view()),
+    path('matches/<int:pk>/score', AdminMatchScoreView.as_view()),
     path('matches/<int:pk>/lineup', AdminMatchLineupView.as_view()),
 
     # 事件

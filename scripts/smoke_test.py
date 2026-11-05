@@ -3,6 +3,9 @@
 前置：服务已运行在 127.0.0.1:8000，且已完成 migrate / seed_admin。
 用法：python scripts/smoke_test.py
 """
+import hashlib
+import hmac
+import json
 import os
 import random
 import sys
@@ -22,7 +25,7 @@ import django  # noqa: E402
 django.setup()
 
 from apps.accounts.models import AthleteProfile, User, UserRole  # noqa: E402
-from apps.live.models import Match, MatchEvent, MatchStatus  # noqa: E402
+from apps.live.models import LiveDevice, LiveScoreFeed, Match, MatchEvent, MatchStatus  # noqa: E402
 from apps.org.models import City, GroupType, School, Team, TeamStatus  # noqa: E402
 
 PASSED = []
@@ -413,7 +416,127 @@ def main():
     status, body = api('POST', f'/api/admin/live/matches/{match_id}/report', token=personal_token, json={})
     check('个人角色不可生成(20004)', body.get('code') == 20004, str(body)[:200])
 
-    print('== 12. 登出 ==')
+    print('== 12. 榜单 ==')
+    MatchEvent.objects.create(
+        match_id=match_id, type='goal', minute=30, team_side='home',
+        athlete_id=profile.id, player_name='王球员', player_no='10',
+        client_token=f'rank-{suffix}',
+    )
+    Match.objects.filter(pk=match_id).update(home_score=2)
+
+    status, body = api('GET', '/api/public/live/leaderboards')
+    data = body.get('data') or {}
+    check('榜单免登可读', body.get('code') == 0
+          and all(k in data for k in ('top_scorers', 'group_goals', 'team_goals')), str(body)[:200])
+    check('分组进球统计三组', len(data.get('group_goals') or []) == 3, str(data.get('group_goals'))[:200])
+    scorers = data.get('top_scorers') or []
+    check('选手榜字段齐全', bool(scorers) and all(k in scorers[0] for k in ('rank', 'goals', 'has_athlete')),
+          str(scorers)[:200])
+    check('选手榜含运动员关联', any(row.get('has_athlete') for row in scorers), str(scorers)[:200])
+
+    status, body = api('GET', '/api/public/live/leaderboards?group_type=middle_school&limit=5')
+    data = body.get('data') or {}
+    check('按组别过滤', data.get('group_type') == 'middle_school' and len(data.get('group_goals') or []) == 1,
+          str(data.get('group_goals'))[:200])
+    check('组别标签中文', (data.get('group_goals') or [{}])[0].get('label') == '中学组', str(data.get('group_goals'))[:200])
+
+    status, body = api('GET', '/api/public/live/leaderboards?group_type=bad')
+    check('非法组别(10001)', body.get('code') == 10001, str(body)[:200])
+    status, body = api('GET', '/api/public/live/leaderboards?limit=abc')
+    check('非法 limit(10001)', body.get('code') == 10001, str(body)[:200])
+
+    status, body = api('GET', '/api/athlete/standings', token=athlete_token)
+    data = body.get('data') or {}
+    my_rank = data.get('my_rank') or {}
+    check('运动员端个人排名', my_rank.get('rank') == 1 and my_rank.get('goals') >= 1, str(data.get('my_rank'))[:200])
+    check('运动员端球队进球榜', len(data.get('team_goals') or []) >= 2, str(data.get('team_goals'))[:200])
+
+    print('== 13. 计分板网关 ==')
+    device, _ = LiveDevice.objects.get_or_create(
+        device_no='GW-SMOKE',
+        defaults={'name': '冒烟网关', 'secret': 'smoke-secret', 'match': pending_match},
+    )
+    device.secret = 'smoke-secret'
+    device.match = pending_match
+    device.enabled = True
+    device.last_seq = 0
+    device.save()
+    LiveScoreFeed.objects.filter(device=device).delete()
+
+    def signed_post(payload, secret='smoke-secret', device_no='GW-SMOKE'):
+        body = json.dumps(payload, separators=(',', ':')).encode()
+        timestamp = str(int(time.time()))
+        nonce = uuid.uuid4().hex[:16]
+        sign_str = '\n'.join(['POST', '/api/device/live/report', timestamp, nonce,
+                              hashlib.sha256(body).hexdigest()])
+        sign = hmac.new(secret.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+        return api('POST', '/api/device/live/report', data=body, headers={
+            'X-Device-Id': device_no, 'X-Timestamp': timestamp,
+            'X-Nonce': nonce, 'X-Sign': sign, 'Content-Type': 'application/json',
+        })
+
+    status, body = signed_post({'seq': 101, 'home_score': 1, 'away_score': 0,
+                                'stage': 'first_half', 'clock_minute': 12})
+    check('网关上报成功', body.get('code') == 0 and body.get('data', {}).get('home_score') == 1
+          and body.get('data', {}).get('status') == 'live', str(body)[:200])
+
+    status, body = signed_post({'seq': 101, 'home_score': 1, 'away_score': 0, 'stage': 'first_half'})
+    check('重复 seq(40009)', body.get('code') == 40009, str(body)[:200])
+
+    status, body = signed_post({'seq': 100, 'home_score': 0, 'away_score': 0, 'stage': 'first_half'})
+    check('seq 乱序(40004)', body.get('code') == 40004, str(body)[:200])
+
+    status, body = signed_post({'seq': 102, 'home_score': 0, 'away_score': 0, 'stage': 'first_half'})
+    check('比分回退(40001)', body.get('code') == 40001, str(body)[:200])
+
+    status, body = signed_post({'seq': 102, 'home_score': 2, 'away_score': 1, 'stage': 'second_half'})
+    check('下半场比分更新', body.get('code') == 0 and body.get('data', {}).get('stage') == 'second_half',
+          str(body)[:200])
+
+    status, body = api('GET', f'/api/admin/live/matches/{pending_match.id}', token=admin_token)
+    current_version = (body.get('data') or {}).get('version')
+    status, body = api('POST', f'/api/admin/live/matches/{pending_match.id}/score', token=admin_token, data={
+        'home_score': 2, 'away_score': 1, 'stage': 'second_half', 'clock_minute': 70,
+        'version': current_version,
+    })
+    check('人工补报比分(来源 manual)', body.get('code') == 0
+          and body.get('data', {}).get('score_source') == 'manual'
+          and body.get('data', {}).get('clock_minute') == 70, str(body)[:200])
+
+    status, body = signed_post({'seq': 103, 'home_score': 2, 'away_score': 1, 'stage': 'bad_stage'})
+    check('非法阶段(10001)', body.get('code') == 10001, str(body)[:200])
+
+    status, body = signed_post({'seq': 104, 'home_score': 2, 'away_score': 1, 'stage': 'finished'},
+                               secret='wrong-secret')
+    check('签名错误(20004)', body.get('code') == 20004, str(body)[:200])
+
+    status, body = signed_post({'seq': 104, 'home_score': 2, 'away_score': 1, 'stage': 'finished'})
+    check('完场上报成功', body.get('code') == 0 and body.get('data', {}).get('status') == 'finished',
+          str(body)[:200])
+
+    status, body = signed_post({'seq': 105, 'home_score': 3, 'away_score': 1, 'stage': 'finished'})
+    check('完场后锁定(40002)', body.get('code') == 40002, str(body)[:200])
+
+    status, body = api('GET', f'/api/admin/live/matches/{pending_match.id}', token=admin_token)
+    current_version = (body.get('data') or {}).get('version')
+    status, body = api('POST', f'/api/admin/live/matches/{pending_match.id}/score', token=admin_token, data={
+        'home_score': 1, 'away_score': 1, 'version': current_version,
+    })
+    check('完场后人工补报(40002)', body.get('code') == 40002, str(body)[:200])
+
+    feeds = LiveScoreFeed.objects.filter(device=device)
+    check('报文留痕含失败记录', feeds.count() >= 5 and feeds.filter(applied=True).count() == 3,
+          f'total={feeds.count()} applied={feeds.filter(applied=True).count()}')
+
+    status, body = api('GET', '/api/public/live/matches?page=1&page_size=50')
+    rows = (body.get('data') or {}).get('list') or []
+    target = next((row for row in rows if row.get('id') == pending_match.id), {})
+    check('公众端展示阶段与来源', target.get('stage') == 'finished'
+          and target.get('stage_label') == '完场'
+          and target.get('score_source') == 'device'
+          and target.get('score_source_label') == '本域网关', str(target)[:200])
+
+    print('== 14. 登出 ==')
     status, body = api('POST', '/api/auth/logout', token=admin_token)
     check('登出', body.get('code') == 0, str(body)[:200])
 

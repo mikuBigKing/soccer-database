@@ -16,6 +16,7 @@ from .models import (
     MatchFile,
     MatchFileType,
     MatchReferee,
+    MatchStage,
     MatchStatus,
     RefereeRole,
 )
@@ -26,6 +27,8 @@ GROUP_TYPES = [c[0] for c in GroupType.choices]
 class MatchListSerializer(serializers.ModelSerializer):
     group_type_label = serializers.CharField(source='get_group_type_display', read_only=True)
     status_label = serializers.CharField(source='get_status_display', read_only=True)
+    stage_label = serializers.CharField(source='get_stage_display', read_only=True)
+    score_source_label = serializers.CharField(source='get_score_source_display', read_only=True)
     match_time = serializers.SerializerMethodField()
 
     class Meta:
@@ -34,6 +37,7 @@ class MatchListSerializer(serializers.ModelSerializer):
             'id', 'group_type', 'group_type_label', 'home_team_name', 'away_team_name',
             'home_team_logo', 'away_team_logo', 'match_time', 'venue',
             'status', 'status_label', 'home_score', 'away_score',
+            'stage', 'stage_label', 'clock_minute', 'score_source', 'score_source_label',
         )
 
     def get_match_time(self, obj):
@@ -227,3 +231,25 @@ class FaceVerifySerializer(serializers.Serializer):
     player_name = serializers.CharField(max_length=50)
     player_no = serializers.CharField(max_length=16, required=False, allow_null=True, allow_blank=True)
     photo = serializers.ImageField()
+
+
+class DeviceScoreReportSerializer(serializers.Serializer):
+    """计分网关上报报文（HMAC 签名在视图层校验）。"""
+
+    seq = serializers.IntegerField(min_value=1)
+    home_score = serializers.IntegerField(min_value=0, max_value=999)
+    away_score = serializers.IntegerField(min_value=0, max_value=999)
+    stage = serializers.ChoiceField(choices=MatchStage.choices)
+    clock_minute = serializers.IntegerField(min_value=0, max_value=150, required=False, allow_null=True)
+    reported_at = serializers.DateTimeField(required=False, allow_null=True)
+    match_id = serializers.IntegerField(required=False, allow_null=True)
+
+
+class ManualScoreSerializer(serializers.Serializer):
+    """人工补报比分（网关/厂商链路异常时兜底，落库后来源标记为 manual）。"""
+
+    home_score = serializers.IntegerField(min_value=0, max_value=999)
+    away_score = serializers.IntegerField(min_value=0, max_value=999)
+    stage = serializers.ChoiceField(choices=MatchStage.choices, required=False)
+    clock_minute = serializers.IntegerField(min_value=0, max_value=150, required=False, allow_null=True)
+    version = serializers.IntegerField(min_value=0)

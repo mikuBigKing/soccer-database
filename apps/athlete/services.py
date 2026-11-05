@@ -195,7 +195,21 @@ class AthleteService:
                 'goals': row['goals'],
             })
 
-        return {'group_type': group_type, 'standings': rows, 'top_scorers': top_scorers}
+        from apps.live import leaderboard
+
+        my_rank = None
+        for row in leaderboard.top_scorers(group_type, limit=1000):
+            if row.get('athlete_id') == profile.id:
+                my_rank = {'athlete_id': profile.id, 'goals': row['goals'], 'rank': row['rank']}
+                break
+
+        return {
+            'group_type': group_type,
+            'standings': rows,
+            'top_scorers': top_scorers,
+            'my_rank': my_rank,
+            'team_goals': leaderboard.team_goals(group_type),
+        }
 
     @staticmethod
     def _require_profile(user) -> AthleteProfile:

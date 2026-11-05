@@ -18,3 +18,7 @@ storage/
 .idea/
 .vscode/
 *.swp
+
+# 网关运行产物（队列与日志不入库）
+gateway/data/
+gateway/logs/

@@ -1,0 +1,18 @@
+cloud:
+  base_url: http://127.0.0.1:8000
+  device_id: GW-SMOKE          # 需与云端 live_devices.device_no 一致
+  secret: change-me            # 现场灌装真实密钥，勿提交仓库
+  match_id: 0                  # 0 = 使用设备绑定的比赛；>0 = 报文带 match_id
+  timeout: 10
+
+serial:
+  port: COM3
+  baudrate: 115200
+  timeout: 1.0
+
+cache:
+  path: gateway/data/queue.sqlite3
+  retry_base_ms: 1000
+  retry_max_ms: 60000
+
+log_path: gateway/logs/gateway.log

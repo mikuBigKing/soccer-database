@@ -21,6 +21,7 @@ urlpatterns = [
     path('api/', include('apps.accounts.urls')),
     path('api/public/live/', include('apps.live.urls_public')),
     path('api/admin/live/', include('apps.live.urls_admin')),
+    path('api/device/', include('apps.live.urls_device')),
     path('api/public/live/', include('apps.report.urls_public')),
     path('api/admin/live/', include('apps.report.urls_admin')),
     path('api/admin/', include('apps.org.urls')),

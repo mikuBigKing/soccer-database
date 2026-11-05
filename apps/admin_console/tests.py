@@ -2680,3 +2680,120 @@ class ScopeTransferTest(BaseAdminData):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['code'], 0)
 
+
+# ---------------------------------------------------------------------------
+# 导出 fields 白名单 + 导入数值上限校验
+# ---------------------------------------------------------------------------
+
+class ExportFieldsAndImportRangeTest(BaseAdminData):
+    """导出 fields（逗号分隔白名单，中文表头）+ 导入身高/体重/球衣号上限。"""
+
+    def _export_rows(self, resp):
+        """StreamingHttpResponse → xlsx 行列表（含表头）。"""
+        import io
+        from openpyxl import load_workbook
+
+        content = b''.join(resp.streaming_content)
+        wb = load_workbook(io.BytesIO(content), read_only=True)
+        return list(wb.active.iter_rows(values_only=True))
+
+    # ---------- 导出 fields ----------
+
+    def test_export_fields_selected_columns(self):
+        """fields=name,school_name → 只导出 2 列，顺序按传入先后（姓名、学校）。"""
+        resp = self.admin_client.get('/api/admin/players/export', {'fields': 'name,school_name'})
+        self.assertEqual(resp.status_code, 200)
+        rows = self._export_rows(resp)
+        self.assertEqual(list(rows[0]), ['姓名', '学校'])
+        # 数据行同样只有 2 列，且列语义正确（张三 → 本校）
+        body = [tuple(r) for r in rows[1:]]
+        self.assertTrue(all(len(r) == 2 for r in body))
+        self.assertIn(('张三', '测试学校'), body)
+
+    def test_export_fields_ignore_invalid_keys(self):
+        """fields=name,foo,bar → 非法键静默忽略，只导出「姓名」1 列。"""
+        resp = self.admin_client.get('/api/admin/players/export', {'fields': 'name,foo,bar'})
+        self.assertEqual(resp.status_code, 200)
+        rows = self._export_rows(resp)
+        self.assertEqual(list(rows[0]), ['姓名'])
+        self.assertTrue(all(len(r) == 1 for r in rows[1:]))
+
+    def test_export_fields_empty_falls_back_to_all(self):
+        """fields= 空串 → 回退导出全部列（默认顺序，第一列为「学校」）。"""
+        resp = self.admin_client.get('/api/admin/players/export', {'fields': ''})
+        self.assertEqual(resp.status_code, 200)
+        rows = self._export_rows(resp)
+        header = list(rows[0])
+        self.assertEqual(len(header), 14)
+        self.assertEqual(header[0], '学校')
+
+    def test_export_fields_keeps_masking(self):
+        """fields=phone_masked,id_card_masked → 仍是脱敏值，不等于真实手机号/身份证。"""
+        resp = self.admin_client.get(
+            '/api/admin/players/export', {'fields': 'phone_masked,id_card_masked'},
+        )
+        self.assertEqual(resp.status_code, 200)
+        rows = self._export_rows(resp)
+        self.assertEqual(list(rows[0]), ['手机号', '身份证号'])
+        real_phones = {'13800000001', '13800000002', '13800000003'}
+        real_ids = {ID_CARD_1, ID_CARD_2}  # p3 无身份证 → 单元格为 None/空
+        for row in rows[1:]:
+            phone_v, id_v = row[0], row[1]
+            phone_s = str(phone_v) if phone_v is not None else ''
+            id_s = str(id_v) if id_v is not None else ''
+            if phone_s:
+                self.assertIn('*', phone_s)
+            if id_s:
+                self.assertIn('*', id_s)
+            self.assertNotIn(phone_s, real_phones)
+            self.assertNotIn(id_s, real_ids)
+
+    # ---------- 教练导出 fields ----------
+
+    def test_coach_export_fields_selected(self):
+        """fields=name → 教练导出只有「姓名」1 列。"""
+        resp = self.admin_client.get('/api/admin/coaches/export', {'fields': 'name'})
+        self.assertEqual(resp.status_code, 200)
+        rows = self._export_rows(resp)
+        self.assertEqual(list(rows[0]), ['姓名'])
+        names = {r[0] for r in rows[1:]}
+        self.assertIn('李教练', names)
+
+    # ---------- 导入数值上限 ----------
+
+    def test_import_reject_out_of_range(self):
+        """球衣号=100、身高=999、体重=999 → 该行失败，报出两条上限错误。"""
+        data = [[
+            '球员X', '13822220001', NEW_ID_CARD_1, self.school.name,
+            '初三', 'male', '前锋', 100, 999, 999,
+        ]]
+        resp = self.admin_client.post(
+            '/api/admin/players/import', {'file': ImportTest._make_xlsx(data)},
+        )
+        body = resp.json()
+        self.assertEqual(body['code'], 0)
+        self.assertEqual(body['data']['success'], 0)
+        self.assertEqual(len(body['data']['failed']), 1)
+        errors_text = ' '.join(body['data']['failed'][0]['errors'])
+        self.assertIn('取值范围 0–99', errors_text)
+        self.assertIn('取值范围 0–220', errors_text)
+        self.assertEqual(AthleteProfile.objects.filter(name='球员X').count(), 0)
+
+    def test_import_accept_boundary_values(self):
+        """球衣号=99、身高=220、体重=220 → 边界值创建成功。"""
+        data = [[
+            '球员Y', '13822220002', NEW_ID_CARD_2, self.school.name,
+            '初二', 'female', '后卫', 99, 220, 220,
+        ]]
+        resp = self.admin_client.post(
+            '/api/admin/players/import', {'file': ImportTest._make_xlsx(data)},
+        )
+        body = resp.json()
+        self.assertEqual(body['data']['success'], 1)
+        self.assertEqual(body['data']['failed'], [])
+        profile = AthleteProfile.objects.get(name='球员Y')
+        self.assertEqual(profile.jersey_no, 99)
+        self.assertEqual(profile.height_cm, 220)
+        self.assertEqual(profile.weight_kg, 220)
+
+

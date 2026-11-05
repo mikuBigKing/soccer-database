@@ -1446,15 +1446,69 @@ def _ensure_team_in_scope(user, team) -> None:
 
 EXPORT_MAX_ROWS = 5000
 
-PLAYER_EXPORT_FIELDS = (
-    'school_name', 'grade', 'name', 'gender', 'position', 'jersey_no',
-    'height_cm', 'weight_kg', 'phone_masked', 'id_card_masked',
-    'status', 'eligibility_status', 'is_public', 'created_at',
-)
-COACH_EXPORT_FIELDS = (
-    'school_name', 'name', 'phone_masked', 'id_card_masked',
-    'qualification', 'status', 'is_public', 'created_at',
-)
+def _player_school_name(profile) -> str:
+    team = profile.team if profile.team_id else None
+    school = profile.school if profile.school_id else (team.school if team else None)
+    return school.name if school else ''
+
+
+def _coach_school_name(profile) -> str:
+    team = profile.user.coached_teams.first() if profile.user_id else None
+    return team.school.name if team else ''
+
+
+# 键 = 导出字段白名单（顺序即默认导出列顺序），值 = (中文表头, 取值函数)
+PLAYER_EXPORT_COLUMNS = {
+    'school_name': ('学校', _player_school_name),
+    'grade': ('年级', lambda p: p.grade or ''),
+    'name': ('姓名', lambda p: p.name or ''),
+    'gender': ('性别', lambda p: p.gender or ''),
+    'position': ('位置', lambda p: p.position or ''),
+    'jersey_no': ('球衣号', lambda p: p.jersey_no if p.jersey_no is not None else ''),
+    'height_cm': ('身高cm', lambda p: p.height_cm if p.height_cm is not None else ''),
+    'weight_kg': ('体重kg', lambda p: p.weight_kg if p.weight_kg is not None else ''),
+    'phone_masked': ('手机号', lambda p: mask_phone(p.user.phone or '') if p.user_id else ''),
+    'id_card_masked': ('身份证号', lambda p: mask_id_card(p.id_card or '') if p.id_card else ''),
+    'status': ('状态', lambda p: p.get_status_display() if p.status else ''),
+    'eligibility_status': ('参赛资格', lambda p: p.get_eligibility_status_display() if p.eligibility_status else ''),
+    'is_public': ('是否公示', lambda p: '是' if p.is_public else '否'),
+    'created_at': ('创建时间', lambda p: format_dt(p.created_at) if p.created_at else ''),
+}
+
+COACH_EXPORT_COLUMNS = {
+    'school_name': ('学校', _coach_school_name),
+    'name': ('姓名', lambda c: c.name or ''),
+    'phone_masked': ('手机号', lambda c: mask_phone(c.user.phone or '') if c.user_id else ''),
+    'id_card_masked': ('身份证号', lambda c: mask_id_card(c.id_card or '') if c.id_card else ''),
+    'qualification': ('资质', lambda c: c.qualification_path or ''),
+    'status': ('状态', lambda c: c.get_status_display() if c.status else ''),
+    'is_public': ('是否公示', lambda c: '是' if c.is_public else '否'),
+    'created_at': ('创建时间', lambda c: format_dt(c.created_at) if c.created_at else ''),
+}
+
+
+def _resolve_export_columns(columns_map: dict, fields_param, default_keys):
+    """解析 fields 参数 → (表头列表, 取值函数列表)。
+
+    - fields_param 为空/None → 用 default_keys（即全部键，保持原有顺序）
+    - 逗号分隔，逐项 strip，只保留白名单内的键，按传入顺序输出，去重
+    - 非法键静默忽略（不报错，避免前端传一个错词整单导出失败）
+    - 全部非法/为空 → 回退 default_keys
+    - key 严格小写匹配（如 NAME 视为非法键）
+    """
+    default_keys = tuple(default_keys)
+    if fields_param is None or not str(fields_param).strip():
+        keys = list(default_keys)
+    else:
+        keys, seen = [], set()
+        for raw in str(fields_param).split(','):
+            key = raw.strip()
+            if key in columns_map and key not in seen:
+                seen.add(key)
+                keys.append(key)
+        if not keys:
+            keys = list(default_keys)
+    return [columns_map[k][0] for k in keys], [columns_map[k][1] for k in keys]
 
 
 def _player_export_queryset(request, params):
@@ -1488,42 +1542,6 @@ def _coach_export_queryset(request, params):
     return qs
 
 
-def _player_export_row(profile):
-    team = profile.team if profile.team_id else None
-    school = profile.school if profile.school_id else (team.school if team else None)
-    return [
-        school.name if school else '',
-        profile.grade or '',
-        profile.name or '',
-        profile.gender or '',
-        profile.position or '',
-        profile.jersey_no if profile.jersey_no is not None else '',
-        profile.height_cm if profile.height_cm is not None else '',
-        profile.weight_kg if profile.weight_kg is not None else '',
-        mask_phone(profile.user.phone or '') if profile.user_id else '',
-        mask_id_card(profile.id_card or '') if profile.id_card else '',
-        profile.get_status_display() if profile.status else '',
-        profile.get_eligibility_status_display() if profile.eligibility_status else '',
-        '是' if profile.is_public else '否',
-        format_dt(profile.created_at) if profile.created_at else '',
-    ]
-
-
-def _coach_export_row(profile):
-    team = profile.user.coached_teams.first() if profile.user_id else None
-    school = team.school if team else None
-    return [
-        school.name if school else '',
-        profile.name or '',
-        mask_phone(profile.user.phone or '') if profile.user_id else '',
-        mask_id_card(profile.id_card or '') if profile.id_card else '',
-        profile.qualification_path or '',
-        profile.get_status_display() if profile.status else '',
-        '是' if profile.is_public else '否',
-        format_dt(profile.created_at) if profile.created_at else '',
-    ]
-
-
 def _write_xlsx(headers, rows_iterable, title: str) -> io.BytesIO:
     from openpyxl import Workbook  # 延迟导入，降低冷启动开销
 
@@ -1540,6 +1558,17 @@ def _write_xlsx(headers, rows_iterable, title: str) -> io.BytesIO:
 
 
 def export_players(request, params: dict) -> StreamingHttpResponse:
+    """导出球员 xlsx。fields 行为约定：
+
+    - 不传 fields / 空串 / 全部非法 → 导出全部列，列顺序与默认一致；
+    - fields=name,school_name → 只导出「姓名」「学校」2 列，顺序按传入先后；
+    - fields=name,foo,bar → 非法键忽略，只导出「姓名」1 列；
+    - fields=NAME → 大小写不符视为非法，忽略（key 严格小写匹配）；
+    - phone_masked / id_card_masked 恒为脱敏值（mask_phone / mask_id_card）。
+
+    注意：PlayerQuerySerializer 未声明 fields，DRF 会丢弃该查询参数，
+    故 params 里没有时从 request.query_params 兜底读取。
+    """
     qs = _player_export_queryset(request, params)
     total = qs.count()
     if total > EXPORT_MAX_ROWS:
@@ -1547,10 +1576,18 @@ def export_players(request, params: dict) -> StreamingHttpResponse:
             ResponseCode.BUSINESS_ERROR, f'导出超过{EXPORT_MAX_ROWS}行，请缩小筛选范围',
         )
 
-    buffer = _write_xlsx(
-        PLAYER_EXPORT_FIELDS, (_player_export_row(p) for p in qs.iterator(chunk_size=2000)),
-        '球员名单',
+    fields_param = params.get('fields')
+    if fields_param is None:
+        fields_param = request.query_params.get('fields')
+    headers, getters = _resolve_export_columns(
+        PLAYER_EXPORT_COLUMNS, fields_param, tuple(PLAYER_EXPORT_COLUMNS),
     )
+
+    def _rows():
+        for p in qs.iterator(chunk_size=2000):
+            yield [get_value(p) for get_value in getters]
+
+    buffer = _write_xlsx(headers, _rows(), '球员名单')
     filename = f'players_{date.today().strftime("%Y%m%d")}.xlsx'
     # RFC 5987 兼容 UTF-8 文件名
     disposition = (
@@ -1567,6 +1604,7 @@ def export_players(request, params: dict) -> StreamingHttpResponse:
 
 
 def export_coaches(request, params: dict) -> StreamingHttpResponse:
+    """导出教练员 xlsx。fields 行为约定与 export_players 相同（见其 docstring）。"""
     qs = _coach_export_queryset(request, params)
     total = qs.count()
     if total > EXPORT_MAX_ROWS:
@@ -1574,10 +1612,18 @@ def export_coaches(request, params: dict) -> StreamingHttpResponse:
             ResponseCode.BUSINESS_ERROR, f'导出超过{EXPORT_MAX_ROWS}行，请缩小筛选范围',
         )
 
-    buffer = _write_xlsx(
-        COACH_EXPORT_FIELDS, (_coach_export_row(c) for c in qs.iterator(chunk_size=2000)),
-        '教练员名单',
+    fields_param = params.get('fields')
+    if fields_param is None:
+        fields_param = request.query_params.get('fields')
+    headers, getters = _resolve_export_columns(
+        COACH_EXPORT_COLUMNS, fields_param, tuple(COACH_EXPORT_COLUMNS),
     )
+
+    def _rows():
+        for c in qs.iterator(chunk_size=2000):
+            yield [get_value(c) for get_value in getters]
+
+    buffer = _write_xlsx(headers, _rows(), '教练员名单')
     filename = f'coaches_{date.today().strftime("%Y%m%d")}.xlsx'
     disposition = (
         f"attachment; filename=\"coaches.xlsx\"; "
@@ -1649,8 +1695,11 @@ def import_players(request, file) -> dict:
 
     try:
         wb = load_workbook(io.BytesIO(file.read()), read_only=True, data_only=True)
-    except Exception as exc:
-        raise BusinessException(ResponseCode.PARAM_INVALID, f'文件格式不合法: {exc}')
+    except Exception:
+        # 不把底层库的原始异常（英文技术信息）暴露给前端
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID, '文件格式不合法，请上传 .xlsx 文件',
+        )
 
     ws = wb.active
     rows = list(ws.iter_rows(values_only=True))
@@ -1694,8 +1743,12 @@ def import_players(request, file) -> dict:
             success_ids.append(profile.id)
         except BusinessException as exc:
             failed.append({'row': idx, 'name': (row[0] or '')[:50], 'errors': [str(exc.msg)]})
-        except Exception as exc:  # pragma: no cover - 兜底
-            failed.append({'row': idx, 'name': (row[0] or '')[:50], 'errors': [f'{exc}']})
+        except Exception:  # pragma: no cover - 兜底，不向前端暴露原始异常
+            failed.append({
+                'row': idx,
+                'name': (row[0] or '')[:50],
+                'errors': ['该行数据处理失败，请检查数据格式'],
+            })
 
     if total >= 3 and len(failed) / total > IMPORT_FAIL_ROLLBACK_RATIO:
         # 整体回滚成功行，防误传（至少 3 行才判"整体有误"，避免单行文件全失败被过度回滚）
@@ -1753,7 +1806,7 @@ def _parse_import_row(row) -> dict:
     if gender and gender not in ('male', 'female'):
         raise BusinessException(ResponseCode.PARAM_INVALID, '性别仅支持 male / female')
 
-    def _int(value, field_name):
+    def _int(value, field_name, max_value=None):
         if value in (None, ''):
             return None
         try:
@@ -1762,16 +1815,40 @@ def _parse_import_row(row) -> dict:
             raise BusinessException(ResponseCode.PARAM_INVALID, f'{field_name} 必须为整数')
         if iv < 0:
             raise BusinessException(ResponseCode.PARAM_INVALID, f'{field_name} 不能为负')
+        if max_value is not None and iv > max_value:
+            raise BusinessException(
+                ResponseCode.PARAM_INVALID, f'{field_name} 取值范围 0–{max_value}',
+            )
         return iv
+
+    # 同一行的数值字段错误一次性收集，便于用户一次改正（上限与序列化器一致）
+    numeric_errors = []
+    try:
+        jersey_no_val = _int(jersey_no, '球衣号', max_value=99)
+    except BusinessException as exc:
+        numeric_errors.append(exc.msg)
+        jersey_no_val = None
+    try:
+        height_val = _int(height_cm, '身高', max_value=220)
+    except BusinessException as exc:
+        numeric_errors.append(exc.msg)
+        height_val = None
+    try:
+        weight_val = _int(weight_kg, '体重', max_value=220)
+    except BusinessException as exc:
+        numeric_errors.append(exc.msg)
+        weight_val = None
+    if numeric_errors:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '；'.join(numeric_errors))
 
     return {
         'name': name, 'phone': phone, 'id_card': id_card, 'school_name': school_name,
         'grade': grade or None,
         'gender': gender or None,
         'position': position or None,
-        'jersey_no': _int(jersey_no, '球衣号'),
-        'height_cm': _int(height_cm, '身高'),
-        'weight_kg': _int(weight_kg, '体重'),
+        'jersey_no': jersey_no_val,
+        'height_cm': height_val,
+        'weight_kg': weight_val,
     }
 
 

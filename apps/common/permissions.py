@@ -32,6 +32,30 @@ def role_permission(*roles: str):
     return type(f'RolePermission_{"_".join(roles)}', (RolePermission,), {'roles': tuple(roles)})
 
 
+def get_user_school(user) -> 'org.School | None':
+    """取校级账号管辖的学校对象。非校级账号返回 None。"""
+    if not user or not user.is_authenticated or getattr(user, 'role', None) != 'school':
+        return None
+    return getattr(user, 'scope_school', None) or getattr(
+        getattr(user, 'school_profile', None), 'school', None
+    )
+
+
+def user_is_ops(user) -> bool:
+    """运营后台可访问角色：admin / province / school。"""
+    return bool(user and user.is_authenticated and getattr(user, 'role', None) in ('admin', 'province', 'school'))
+
+
+def user_is_admin_or_province(user) -> bool:
+    return bool(user and user.is_authenticated and getattr(user, 'role', None) in ('admin', 'province'))
+
+
+def user_is_admin(user) -> bool:
+    return bool(user and user.is_authenticated and (
+        getattr(user, 'role', None) == 'admin' or getattr(user, 'is_superuser', False)
+    ))
+
+
 class LivePermission(BasePermission):
     """权限点白名单：permission:live:match:view 的等价物。管理员直通。"""
 

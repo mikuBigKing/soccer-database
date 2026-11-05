@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'apps.registration',
     'apps.admin_console',
     'apps.report',
+    'apps.eventops',
 ]
 
 MIDDLEWARE = [

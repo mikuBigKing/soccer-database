@@ -1,15 +1,17 @@
 """赛事直播视图：公众端 + 管理端。"""
 import os
 
+from django.db.models import Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.models import SchoolProfile, UserRole
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.pagination import paginate
-from apps.common.permissions import live_permission
+from apps.common.permissions import is_admin, live_permission
 
 from .models import EventType, Match, MatchFile, MatchStatus
 from .serializers import (
@@ -45,6 +47,66 @@ def _get_match(pk: int) -> Match:
     if match is None:
         raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在', status_code=404)
     return match
+
+
+# ---------------- 校级数据范围辅助 ----------------
+
+def _school_id_of(user) -> int | None:
+    """获取当前用户绑定的学校 id；未绑定返回 None。"""
+    if not user or not user.is_authenticated:
+        return None
+    if is_admin(user):
+        return None
+    profile = getattr(user, 'school_profile', None)
+    return profile.school_id if profile else None
+
+
+def _school_match_queryset(user):
+    """返回「主队或客队属于本校」的比赛查询集；管理员/省级返回全量，校级未绑定返回空。"""
+    if is_admin(user) or getattr(user, 'role', None) == UserRole.PROVINCE:
+        return Match.objects.all()
+    school_id = _school_id_of(user)
+    if school_id is None:
+        return Match.objects.none()
+    return Match.objects.filter(
+        Q(home_team__school_id=school_id) | Q(away_team__school_id=school_id)
+    )
+
+
+def _ensure_school_can_host(user, home_team_id, away_team_id):
+    """校验举办比赛的三条硬性规则。"""
+    # ① 参赛球队必选
+    if not home_team_id and not away_team_id:
+        raise BusinessException(ResponseCode.PARAM_INVALID, '必须选择至少一支参赛球队')
+    # ② 球队必须存在
+    from apps.org.models import Team
+    team_ids = [tid for tid in (home_team_id, away_team_id) if tid]
+    existing = set(Team.objects.filter(id__in=team_ids).values_list('id', flat=True))
+    missing = [tid for tid in team_ids if tid not in existing]
+    if missing:
+        raise BusinessException(ResponseCode.PARAM_INVALID, f'球队不存在: {missing}')
+    # ③ 必须含本校球队
+    school_id = _school_id_of(user)
+    if school_id is None:
+        raise BusinessException(ResponseCode.FORBIDDEN, '当前账号未绑定学校')
+    school_team_ids = set(
+        Team.objects.filter(id__in=team_ids, school_id=school_id).values_list('id', flat=True)
+    )
+    if not school_team_ids:
+        raise BusinessException(ResponseCode.FORBIDDEN, '仅可举办含本校球队的比赛')
+
+
+def _ensure_school_match(user, match: Match):
+    """校验比赛是否属于本校（主队或客队），否则抛 20004。管理员/省级放行，校级未绑定拒绝。"""
+    if is_admin(user) or getattr(user, 'role', None) == UserRole.PROVINCE:
+        return
+    school_id = _school_id_of(user)
+    if school_id is None:
+        raise BusinessException(ResponseCode.FORBIDDEN, '当前账号未绑定学校')
+    home_school = getattr(match.home_team, 'school_id', None)
+    away_school = getattr(match.away_team, 'school_id', None)
+    if home_school != school_id and away_school != school_id:
+        raise BusinessException(ResponseCode.FORBIDDEN, '无权操作他校比赛')
 
 
 def _get_event(pk: int):
@@ -130,7 +192,7 @@ class AdminMatchListCreateView(APIView):
         return [live_permission(perm)()]
 
     def get(self, request):
-        queryset = Match.objects.all()
+        queryset = _school_match_queryset(request.user)
         status_value = request.query_params.get('status')
         if status_value:
             queryset = queryset.filter(status=status_value)
@@ -139,9 +201,9 @@ class AdminMatchListCreateView(APIView):
             queryset = queryset.filter(group_type=group_type)
         keyword = request.query_params.get('keyword')
         if keyword:
-            from django.db.models import Q
-
-            queryset = queryset.filter(Q(home_team_name__icontains=keyword) | Q(away_team_name__icontains=keyword))
+            queryset = queryset.filter(
+                Q(home_team_name__icontains=keyword) | Q(away_team_name__icontains=keyword)
+            )
 
         data = paginate(queryset, request)
         data['list'] = AdminMatchDetailSerializer(data['list'], many=True).data
@@ -150,7 +212,15 @@ class AdminMatchListCreateView(APIView):
     def post(self, request):
         serializer = MatchStoreSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        match = MatchService().create(serializer.validated_data, request.user.id)
+        data = serializer.validated_data
+        # 校级举办比赛三条硬性规则
+        if _school_id_of(request.user) is not None:
+            _ensure_school_can_host(
+                request.user,
+                data.get('home_team_id'),
+                data.get('away_team_id'),
+            )
+        match = MatchService().create(data, request.user.id)
         return Response(AdminMatchDetailSerializer(match).data)
 
 
@@ -164,19 +234,29 @@ class AdminMatchDetailView(APIView):
         return [live_permission(perm)()]
 
     def get(self, request, pk: int):
-        return Response(AdminMatchDetailSerializer(_get_match(pk)).data)
+        match = _get_match(pk)
+        _ensure_school_match(request.user, match)
+        return Response(AdminMatchDetailSerializer(match).data)
 
     def put(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         serializer = MatchUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = dict(serializer.validated_data)
+        # 校级编辑比赛时，若修改了参赛球队，需重新校验三条硬性规则
+        if _school_id_of(request.user) is not None:
+            home_team_id = data.get('home_team_id', match.home_team_id)
+            away_team_id = data.get('away_team_id', match.away_team_id)
+            _ensure_school_can_host(request.user, home_team_id, away_team_id)
         version = data.pop('version')
         updated = MatchService().update(match, data, version, request.user.id)
         return Response(AdminMatchDetailSerializer(updated).data)
 
     def delete(self, request, pk: int):
-        MatchService().delete(_get_match(pk), request.user.id)
+        match = _get_match(pk)
+        _ensure_school_match(request.user, match)
+        MatchService().delete(match, request.user.id)
         return Response({'id': pk})
 
 
@@ -186,8 +266,10 @@ class AdminMatchStatusView(APIView):
     def patch(self, request, pk: int):
         serializer = MatchStatusSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         match = MatchService().change_status(
-            _get_match(pk),
+            match,
             serializer.validated_data['action'],
             serializer.validated_data['version'],
             request.user.id,
@@ -201,8 +283,10 @@ class AdminMatchLineupView(APIView):
     def put(self, request, pk: int):
         serializer = LineupSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         match = MatchService().update_lineup(
-            _get_match(pk),
+            match,
             serializer.validated_data['lineup_home'],
             serializer.validated_data['lineup_away'],
             serializer.validated_data['version'],
@@ -216,6 +300,7 @@ class AdminMatchEventView(APIView):
 
     def get(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         queryset = match.events.all()
         since_id = request.query_params.get('since_id')
         if since_id:
@@ -226,6 +311,8 @@ class AdminMatchEventView(APIView):
         return Response(MatchEventSerializer(queryset, many=True).data)
 
     def post(self, request, pk: int):
+        match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         serializer = EventStoreSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         event = MatchEventService().add_event(pk, serializer.validated_data, request.user.id)
@@ -237,6 +324,7 @@ class AdminEventDetailView(APIView):
 
     def put(self, request, pk: int):
         event = _get_event(pk)
+        _ensure_school_match(request.user, event.match)
         match_id = event.match_id
         serializer = EventUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -245,6 +333,7 @@ class AdminEventDetailView(APIView):
 
     def delete(self, request, pk: int):
         event = _get_event(pk)
+        _ensure_school_match(request.user, event.match)
         match_id = event.match_id
         MatchEventService().delete_event(event, request.user.id)
         return Response(_event_action_result(match_id, None))
@@ -255,10 +344,12 @@ class AdminRefereeView(APIView):
 
     def get(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         return Response(RefereeSerializer(RefereeService().list_for_match(match), many=True).data)
 
     def put(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         serializer = RefereesSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         referees = RefereeService().replace(match, serializer.validated_data['referees'], request.user.id)
@@ -270,10 +361,12 @@ class AdminMatchFileView(APIView):
 
     def get(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         return Response(MatchFileSerializer(MatchFileService().list_for_match(match), many=True).data)
 
     def post(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         serializer = MatchFileUploadSerializer(data=request.data)
         if not serializer.is_valid():
             _raise_file_error(serializer)
@@ -293,6 +386,7 @@ class AdminFileDownloadView(APIView):
         record = MatchFile.objects.filter(pk=pk).first()
         if record is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '文件不存在', status_code=404)
+        _ensure_school_match(request.user, record.match)
         path = MatchFileService().absolute_path(record)
         if not os.path.exists(path):
             raise BusinessException(ResponseCode.NOT_FOUND, '文件已丢失', status_code=404)
@@ -306,6 +400,7 @@ class AdminFileDeleteView(APIView):
         record = MatchFile.objects.filter(pk=pk).first()
         if record is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '文件不存在', status_code=404)
+        _ensure_school_match(request.user, record.match)
         MatchFileService().delete(record, request.user.id)
         return Response({'id': pk})
 
@@ -315,6 +410,7 @@ class AdminLiveLinkView(APIView):
 
     def put(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         if match.status == MatchStatus.FINISHED:
             raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED)
         serializer = LiveLinkSerializer(data=request.data)
@@ -330,6 +426,7 @@ class AdminFaceVerifyView(APIView):
 
     def post(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         serializer = FaceVerifySerializer(data=request.data)
         if not serializer.is_valid():
             _raise_file_error(serializer, 'photo')
@@ -348,4 +445,5 @@ class AdminFaceVerifyRecordsView(APIView):
 
     def get(self, request, pk: int):
         match = _get_match(pk)
+        _ensure_school_match(request.user, match)
         return Response(FaceVerifyRecordSerializer(FaceVerifyService().records(match), many=True).data)

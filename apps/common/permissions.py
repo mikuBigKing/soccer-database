@@ -1,6 +1,23 @@
 """DRF 权限类（对应 Laravel EnsureRole / EnsurePermission 中间件）。"""
 from rest_framework.permissions import SAFE_METHODS, BasePermission
 
+# 校级管理员默认权限点，创建校级账号时自动赋予
+SCHOOL_ADMIN_PERMISSIONS = (
+    'live:match:view',
+    'live:match:create',
+    'live:match:update',
+    'live:match:delete',
+    'live:event:manage',
+    'live:referee:manage',
+    'live:file:manage',
+    'live:link:manage',
+    'live:face:manage',
+    'registration:identity:verify',
+    'registration:statistics:view',
+    'school:notification:manage',
+    'school:auditlog:view',
+)
+
 
 def is_admin(user) -> bool:
     return bool(user and user.is_authenticated and (getattr(user, 'role', None) == 'admin' or user.is_superuser))

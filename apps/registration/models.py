@@ -137,3 +137,38 @@ class RegistrationLog(models.Model):
             models.Index(fields=['registration', 'action']),
             models.Index(fields=['actor', 'action']),
         ]
+
+
+class SchoolNotification(models.Model):
+    """校级通知：面向本校教练与运动员。"""
+
+    school = models.ForeignKey('org.School', on_delete=models.CASCADE, related_name='notifications')
+    title = models.CharField('标题', max_length=100)
+    content = models.TextField('内容')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'school_notifications'
+        ordering = ['-id']
+        indexes = [models.Index(fields=['school', '-created_at'])]
+
+
+class SchoolAuditLog(models.Model):
+    """校级操作日志：记录校级管理员的关键操作。"""
+
+    school = models.ForeignKey('org.School', on_delete=models.CASCADE, related_name='audit_logs')
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
+    )
+    action = models.CharField('动作', max_length=50, db_index=True)
+    target = models.CharField('操作对象', max_length=50, null=True, blank=True)
+    detail = models.JSONField('详情', default=dict, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'school_audit_logs'
+        ordering = ['-id']
+        indexes = [models.Index(fields=['school', '-created_at'])]

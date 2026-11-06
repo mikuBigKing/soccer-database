@@ -33,11 +33,11 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, CountyProfile, ProfileStatus, ProvinceProfile, UserRole
+from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, CountyProfile, ProfileStatus, ProvinceProfile, SchoolProfile, UserRole
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.pagination import paginated_response
-from apps.common.permissions import is_admin, role_permission
+from apps.common.permissions import SCHOOL_ADMIN_PERMISSIONS, is_admin, role_permission
 from apps.registration.models import Registration, RegistrationLog
 from apps.registration.serializers import (
     CoachMaterialSerializer,
@@ -61,8 +61,9 @@ User = get_user_model()
 
 ProvinceOnly = role_permission('province')
 
-# 报名账号管理的角色范围：市州/区县/省级/管理员账号
-MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.COUNTY, UserRole.PROVINCE, UserRole.ADMIN)
+# 报名账号管理的角色范围：市州/区县/校级/省级/管理员账号
+MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.COUNTY, UserRole.SCHOOL,
+                         UserRole.PROVINCE, UserRole.ADMIN)
 
 
 # ---------------- 报名审核 ----------------
@@ -468,11 +469,12 @@ class AccountSerializer(serializers.ModelSerializer):
     city_id = serializers.SerializerMethodField()
     province_id = serializers.SerializerMethodField()
     county = serializers.SerializerMethodField()
+    school_id = serializers.SerializerMethodField()
 
     class Meta:
         model = User
         fields = ('id', 'name', 'phone', 'email', 'role', 'role_display', 'status',
-                  'city_id', 'province_id', 'county', 'date_joined')
+                  'city_id', 'province_id', 'county', 'school_id', 'date_joined')
 
     def get_city_id(self, obj):
         profile = getattr(obj, 'city_profile', None) or getattr(obj, 'county_profile', None)
@@ -486,6 +488,10 @@ class AccountSerializer(serializers.ModelSerializer):
         profile = getattr(obj, 'county_profile', None)
         return profile.county if profile else None
 
+    def get_school_id(self, obj):
+        profile = getattr(obj, 'school_profile', None)
+        return profile.school_id if profile else None
+
 
 class AccountCreateSerializer(serializers.Serializer):
     role = serializers.ChoiceField(choices=MANAGED_ACCOUNT_ROLES)
@@ -496,6 +502,7 @@ class AccountCreateSerializer(serializers.Serializer):
     city_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     province_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     county = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    school_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
 
     def validate(self, attrs):
         role = attrs['role']
@@ -506,7 +513,7 @@ class AccountCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({'email': '该邮箱已被使用'})
         else:
             if not attrs.get('phone'):
-                raise serializers.ValidationError({'phone': '市州/区县/省级账号必须提供手机号'})
+                raise serializers.ValidationError({'phone': '市州/区县/校级/省级账号必须提供手机号'})
             if User.objects.filter(phone=attrs['phone']).exists():
                 raise serializers.ValidationError({'phone': '该手机号已被注册'})
         if role == UserRole.CITY and not attrs.get('city_id'):
@@ -516,6 +523,8 @@ class AccountCreateSerializer(serializers.Serializer):
                 raise serializers.ValidationError({'city_id': '区县账号必须选择所属市州'})
             if not attrs.get('county'):
                 raise serializers.ValidationError({'county': '区县账号必须填写区县名称'})
+        if role == UserRole.SCHOOL and not attrs.get('school_id'):
+            raise serializers.ValidationError({'school_id': '校级账号必须选择所属学校'})
         if role == UserRole.PROVINCE and not attrs.get('province_id'):
             raise serializers.ValidationError({'province_id': '省级账号必须选择所属省份'})
         return attrs
@@ -530,6 +539,7 @@ class AccountUpdateSerializer(serializers.Serializer):
     city_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     province_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     county = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    school_id = serializers.IntegerField(min_value=1, required=False, allow_null=True)
     permissions = serializers.ListField(
         child=serializers.CharField(max_length=100), required=False, allow_empty=True,
     )
@@ -588,6 +598,11 @@ class ProvinceAccountListCreateView(APIView):
                 CountyProfile.objects.create(
                     user=user, name=data['name'], city_id=data['city_id'], county=data['county'],
                 )
+            elif data['role'] == UserRole.SCHOOL:
+                SchoolProfile.objects.create(user=user, name=data['name'], school_id=data['school_id'])
+                # 校级账号默认赋予 9 个 live:* 权限点
+                user.permissions = list(SCHOOL_ADMIN_PERMISSIONS)
+                user.save(update_fields=['permissions'])
             elif data['role'] == UserRole.PROVINCE:
                 ProvinceProfile.objects.create(user=user, name=data['name'], province_id=data['province_id'])
 
@@ -636,6 +651,11 @@ class ProvinceAccountDetailView(APIView):
             profile.province_id = data['province_id']
             profile.save()
             changed.append('province_id')
+        if 'school_id' in data and target.role == UserRole.SCHOOL:
+            profile = getattr(target, 'school_profile', None) or SchoolProfile(user=target, name=target.name)
+            profile.school_id = data['school_id']
+            profile.save()
+            changed.append('school_id')
 
         if 'permissions' in data:
             if not is_admin(request.user):

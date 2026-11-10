@@ -1,0 +1,7 @@
+rfdetr>=1.12.0
+opencv-python>=4.9
+numpy>=1.26
+# torch/torchvision: install the CUDA build that matches your driver first, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+# For fine-tuning only:
+#   pip install "rfdetr[train,loggers]"

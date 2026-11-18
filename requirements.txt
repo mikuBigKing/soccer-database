@@ -2,8 +2,13 @@ Django>=6.1,<6.2
 djangorestframework>=3.18,<3.19
 djangorestframework-simplejwt>=5.5,<5.6
 django-filter>=26.2
+django-cors-headers>=4.6,<5
 Pillow>=11.3
 python-dotenv>=1.0
 requests>=2.34
 python-docx>=1.1
 openpyxl>=3.1
+# 生产 MySQL 驱动（纯 Python，免编译；未安装时回退 mysqlclient）
+PyMySQL>=1.1,<2
+# 生产 WSGI 服务器（Windows 本地开发不需要）
+gunicorn>=23.0; platform_system != "Windows"

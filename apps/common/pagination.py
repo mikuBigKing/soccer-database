@@ -16,13 +16,14 @@ def paginate(queryset, request, default_size: int = 20, max_size: int = 100) -> 
     try:
         current = paginator.page(page)
     except EmptyPage:
+        # 请求页超界时返回实际末页，并把 page 修正为真实页码，避免前端分页器误判
         current = paginator.page(paginator.num_pages or 1)
 
     return {
         'list': list(current.object_list),
         'next_page': current.next_page_number() if current.has_next() else None,
         'total': paginator.count,
-        'page': page,
+        'page': current.number,
         'page_size': page_size,
     }
 

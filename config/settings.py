@@ -4,9 +4,13 @@
 - DB_ENGINE=sqlite|mysql，默认 sqlite 便于本地冒烟
 - CACHE/SESSION 不依赖外部服务
 """
+import importlib.util
 import os
+import sys
 from datetime import timedelta
 from pathlib import Path
+
+from django.core.exceptions import ImproperlyConfigured
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
@@ -17,14 +21,40 @@ try:  # pragma: no cover
 except ImportError:  # pragma: no cover
     pass
 
+# 开发期默认密钥只允许在 DEBUG 或本地管理命令（test/check/migrate 等）下使用，
+# 生产环境缺 DJANGO_SECRET_KEY 直接启动失败，避免误用公开密钥。
+DEV_SECRET_KEY = 'django-insecure-dev-only-key-please-change'
+_LOCAL_COMMANDS = {
+    'test', 'check', 'makemigrations', 'migrate', 'showmigrations', 'sqlmigrate',
+    'shell', 'collectstatic', 'createsuperuser', 'seed_admin', 'smoke_test.py',
+}
+
 
 def env_bool(name: str, default: bool = False) -> bool:
     return os.getenv(name, '1' if default else '0').strip().lower() in ('1', 'true', 'yes', 'on')
 
 
-SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-dev-only-key-please-change')
-DEBUG = env_bool('DJANGO_DEBUG', True)
-ALLOWED_HOSTS = [h.strip() for h in os.getenv('DJANGO_ALLOWED_HOSTS', '*').split(',') if h.strip()]
+def env_list(name: str, default: str = '') -> list[str]:
+    return [item.strip() for item in os.getenv(name, default).split(',') if item.strip()]
+
+
+DEBUG = env_bool('DJANGO_DEBUG', False)
+_RUNNING_LOCAL_COMMAND = bool({Path(arg).name for arg in sys.argv[:2]} & _LOCAL_COMMANDS)
+
+SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', '').strip()
+if not SECRET_KEY:
+    if DEBUG or _RUNNING_LOCAL_COMMAND:
+        SECRET_KEY = DEV_SECRET_KEY
+    else:
+        raise ImproperlyConfigured(
+            '生产环境必须通过环境变量 DJANGO_SECRET_KEY 配置密钥（本地开发请在 .env 设置 DJANGO_DEBUG=1）'
+        )
+
+ALLOWED_HOSTS = env_list('DJANGO_ALLOWED_HOSTS', '127.0.0.1,localhost')
+if not DEBUG and ('*' in ALLOWED_HOSTS or not ALLOWED_HOSTS):
+    raise ImproperlyConfigured(
+        '生产环境必须通过 DJANGO_ALLOWED_HOSTS 显式配置允许的域名，且不能使用 *'
+    )
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -45,9 +75,19 @@ INSTALLED_APPS = [
     'apps.registration',
 ]
 
+# 前后端分域部署时启用 CORS（同源反向代理部署可不配置）。
+# 依赖未安装时不影响同源部署启动。
+HAS_CORS = importlib.util.find_spec('corsheaders') is not None
+if HAS_CORS:
+    INSTALLED_APPS.insert(1, 'corsheaders')
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+]
+if HAS_CORS:
+    MIDDLEWARE.append('corsheaders.middleware.CorsMiddleware')
+MIDDLEWARE += [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
@@ -80,6 +120,13 @@ WSGI_APPLICATION = 'config.wsgi.application'
 ASGI_APPLICATION = 'config.asgi.application'
 
 if os.getenv('DB_ENGINE', 'sqlite').lower() == 'mysql':
+    # 生产 MySQL：优先使用 PyMySQL（纯 Python，免编译），未安装时回退 mysqlclient
+    try:  # pragma: no cover
+        import pymysql
+
+        pymysql.install_as_MySQLdb()
+    except ImportError:  # pragma: no cover
+        pass
     DATABASES = {
         'default': {
             'ENGINE': 'django.db.backends.mysql',
@@ -110,7 +157,7 @@ TIME_ZONE = 'Asia/Shanghai'
 USE_I18N = True
 USE_TZ = True
 
-STATIC_URL = 'static/'
+STATIC_URL = '/static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 MEDIA_URL = '/media/'
@@ -127,11 +174,11 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 
 REST_FRAMEWORK = {
     'DEFAULT_AUTHENTICATION_CLASSES': (
-        'rest_framework_simplejwt.authentication.JWTAuthentication',
+        'apps.accounts.authentication.ActiveUserJWTAuthentication',
     ),
-    # 与 Laravel 一致：默认放开，具体接口在视图上声明权限
+    # 默认要求登录，公开接口在视图上显式 AllowAny，避免新视图默认裸奔。
     'DEFAULT_PERMISSION_CLASSES': (
-        'rest_framework.permissions.AllowAny',
+        'rest_framework.permissions.IsAuthenticated',
     ),
     'DEFAULT_RENDERER_CLASSES': (
         'apps.common.renderers.UnifiedJSONRenderer',
@@ -140,6 +187,20 @@ REST_FRAMEWORK = {
     'UNAUTHENTICATED_USER': 'django.contrib.auth.models.AnonymousUser',
     'DEFAULT_FILTER_BACKENDS': ('django_filters.rest_framework.DjangoFilterBackend',),
 }
+
+if HAS_CORS:
+    # 分域部署白名单：默认只放开本地开发端口，生产通过环境变量覆盖。
+    CORS_ALLOWED_ORIGINS = env_list(
+        'CORS_ALLOWED_ORIGINS',
+        'http://localhost:8083,http://127.0.0.1:8083',
+    )
+    CORS_ALLOW_CREDENTIALS = True
+    CORS_ALLOW_HEADERS = (
+        'accept', 'accept-encoding', 'authorization', 'content-type',
+        'dnt', 'origin', 'user-agent', 'x-csrftoken', 'x-requested-with',
+        'x-request-id',
+    )
+    CORS_EXPOSE_HEADERS = ('X-Request-ID',)
 
 SIMPLE_JWT = {
     'ACCESS_TOKEN_LIFETIME': timedelta(hours=8),

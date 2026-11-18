@@ -1,5 +1,5 @@
-"""校级端视图：实名审核、统计报表、通知、操作日志。"""
-from django.db.models import Count
+"""校级端视图：实名审核、球队/教练/球员列表、统计报表、通知、操作日志。"""
+from django.db.models import Count, Q
 from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -56,8 +56,10 @@ class SchoolCoachVerifyView(APIView):
         profile = CoachProfile.objects.filter(pk=pk).first()
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '教练不存在', status_code=404)
-        # 教练通过其执教的球队归属本校
-        if not Team.objects.filter(coach=profile.user, school_id=school_id).exists():
+        # 教练通过其执教的球队归属本校；尚未建队的新教练允许任一校级账号做实名审核
+        has_team_here = Team.objects.filter(coach=profile.user, school_id=school_id).exists()
+        has_any_team = Team.objects.filter(coach=profile.user).exists()
+        if not has_team_here and has_any_team:
             raise BusinessException(ResponseCode.FORBIDDEN, '无权审核他校教练')
         if profile.status != ProfileStatus.PENDING:
             raise BusinessException(ResponseCode.PARAM_INVALID, '仅待审核的实名认证可操作')
@@ -94,8 +96,8 @@ class SchoolAthleteVerifyView(APIView):
         profile = AthleteProfile.objects.filter(pk=pk).first()
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
-        # 球员通过其球队归属本校
-        if not profile.team or profile.team.school_id != school_id:
+        # 球员通过其球队归属本校；尚未挂队的新球员允许任一校级账号做实名审核
+        if profile.team_id and profile.team.school_id != school_id:
             raise BusinessException(ResponseCode.FORBIDDEN, '无权审核他校球员')
         if profile.status != ProfileStatus.PENDING:
             raise BusinessException(ResponseCode.PARAM_INVALID, '仅待审核的实名认证可操作')
@@ -120,6 +122,52 @@ class SchoolAthleteVerifyView(APIView):
         write_log(action, request.user, None, detail)
         _write_audit(school_id, request.user, action, 'athlete', {'athlete_id': profile.pk})
         return Response(PlayerMaterialSerializer(profile).data)
+
+
+# ---------------- 本校教练 / 球员列表 ----------------
+
+class SchoolCoachListView(APIView):
+    """本校教练列表（通过其执教的球队归属本校），供实名审核与球队管理使用。"""
+
+    permission_classes = [SchoolOnly]
+
+    def get(self, request):
+        school_id = _school_id_or_403(request)
+        coach_ids = Team.objects.filter(school_id=school_id).values_list('coach_id', flat=True)
+        # 已挂靠本校球队的教练 + 尚未建队的待审教练（新注册教练需先完成实名审核才能建队）
+        queryset = CoachProfile.objects.select_related('user').filter(
+            Q(user_id__in=coach_ids) | Q(status=ProfileStatus.PENDING, user__coached_teams__isnull=True)
+        ).distinct().order_by('id')
+        status_value = request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(Q(name__icontains=keyword) | Q(phone__icontains=keyword))
+        return Response(paginated_response(queryset, request, CoachMaterialSerializer))
+
+
+class SchoolAthleteListView(APIView):
+    """本校球员列表，供实名审核使用。"""
+
+    permission_classes = [SchoolOnly]
+
+    def get(self, request):
+        school_id = _school_id_or_403(request)
+        # 已在本校球队的球员 + 尚未挂队的待审球员
+        queryset = AthleteProfile.objects.select_related('user', 'team').filter(
+            Q(team__school_id=school_id) | Q(team__isnull=True, status=ProfileStatus.PENDING)
+        ).distinct().order_by('jersey_no', 'id')
+        status_value = request.query_params.get('status')
+        if status_value:
+            queryset = queryset.filter(status=status_value)
+        team_id = request.query_params.get('team_id')
+        if team_id:
+            queryset = queryset.filter(team_id=team_id)
+        keyword = request.query_params.get('keyword')
+        if keyword:
+            queryset = queryset.filter(Q(name__icontains=keyword) | Q(team__name__icontains=keyword))
+        return Response(paginated_response(queryset, request, PlayerMaterialSerializer))
 
 
 # ---------------- 本校统计报表 ----------------
@@ -235,6 +283,7 @@ class SchoolAuditLogListView(APIView):
         if action:
             allowed = {
                 'identity.approve', 'identity.reject', 'notification.create',
+                'team.approve', 'team.reject',
                 'match.create', 'match.update', 'match.delete',
             }
             if action not in allowed:

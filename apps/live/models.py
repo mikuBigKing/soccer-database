@@ -46,6 +46,15 @@ class SoftDeleteManager(models.Manager):
 
 
 class Match(models.Model):
+    # 比赛归属赛事：积分榜/射手榜按赛事统计，避免跨赛事混算
+    competition = models.ForeignKey(
+        'registration.Competition',
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name='matches',
+        db_index=True,
+    )
     group_type = models.CharField('组别', max_length=32, choices=GroupType.choices)
     home_team_name = models.CharField('主队名称', max_length=100)
     away_team_name = models.CharField('客队名称', max_length=100)
@@ -79,6 +88,7 @@ class Match(models.Model):
         db_table = 'matches'
         ordering = ['-match_time', '-id']
         indexes = [
+            models.Index(fields=['competition', 'status', 'match_time']),
             models.Index(fields=['group_type', 'status', 'match_time']),
             models.Index(fields=['status', 'match_time']),
             models.Index(fields=['home_team', 'status', 'match_time']),

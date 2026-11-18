@@ -19,6 +19,7 @@ from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.pagination import paginated_response
 from apps.common.permissions import is_admin, role_permission
+from apps.org.models import GroupType
 from apps.registration.models import Registration
 from apps.registration.serializers import (
     BatchReportSerializer,
@@ -147,10 +148,13 @@ class CityRegistrationSummaryView(APIView):
         if competition_id:
             queryset = queryset.filter(competition_id=competition_id)
 
-        def status_counts(rows, name_key):
+        group_labels = dict(GroupType.choices)
+
+        def status_counts(rows, mapping):
             result = []
             for row in rows:
-                item = {'name': row[name_key], 'total': row['total']}
+                item = {friendly: row[raw] for friendly, raw in mapping.items()}
+                item['total'] = row['total']
                 for status_value, label in Registration.Status.choices:
                     item[status_value] = row.get(status_value, 0)
                 result.append(item)
@@ -168,13 +172,16 @@ class CityRegistrationSummaryView(APIView):
             .annotate(**{s: Count('id', filter=Q(status=s)) for s, _ in Registration.Status.choices})
             .order_by('team__group_type')
         )
+        by_group = status_counts(by_group_rows, {'group_type': 'team__group_type'})
+        for item in by_group:
+            item['group_type_label'] = group_labels.get(item['group_type'], item['group_type'])
         county = _county_of(request.user)
         scope = 'county' if county else ('city' if not is_admin(request.user) else 'all')
         return Response({
             'scope': scope,
             'county': county,
-            'by_school': status_counts(by_school_rows, 'team__school__name'),
-            'by_group': status_counts(by_group_rows, 'team__group_type'),
+            'by_school': status_counts(by_school_rows, {'school_name': 'team__school__name'}),
+            'by_group': by_group,
             'total': queryset.count(),
         })
 

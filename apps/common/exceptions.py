@@ -5,9 +5,13 @@
 """
 import logging
 
+from django.db.models.deletion import ProtectedError
 from rest_framework import exceptions, status
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
+from rest_framework_simplejwt.exceptions import InvalidToken, TokenError
+
+from apps.accounts.authentication import AccountDisabled
 
 from .codes import ResponseCode, message_of
 from .renderers import envelope
@@ -26,23 +30,38 @@ class BusinessException(Exception):
         super().__init__(self.msg)
 
 
-CODE_MAP = {
-    exceptions.NotAuthenticated: ResponseCode.UNAUTHENTICATED,
-    exceptions.AuthenticationFailed: ResponseCode.CREDENTIALS_INVALID,
-    exceptions.PermissionDenied: ResponseCode.FORBIDDEN,
-    exceptions.NotFound: ResponseCode.NOT_FOUND,
-    exceptions.ValidationError: ResponseCode.PARAM_INVALID,
-    exceptions.MethodNotAllowed: ResponseCode.PARAM_INVALID,
-    exceptions.Throttled: ResponseCode.SYSTEM_ERROR,
-}
+CODE_MAP = (
+    (AccountDisabled, ResponseCode.ACCOUNT_DISABLED),
+    (InvalidToken, ResponseCode.UNAUTHENTICATED),
+    (TokenError, ResponseCode.UNAUTHENTICATED),
+    (exceptions.NotAuthenticated, ResponseCode.UNAUTHENTICATED),
+    (exceptions.AuthenticationFailed, ResponseCode.CREDENTIALS_INVALID),
+    (exceptions.PermissionDenied, ResponseCode.FORBIDDEN),
+    (exceptions.NotFound, ResponseCode.NOT_FOUND),
+    (exceptions.ValidationError, ResponseCode.PARAM_INVALID),
+    (exceptions.MethodNotAllowed, ResponseCode.PARAM_INVALID),
+    (exceptions.Throttled, ResponseCode.SYSTEM_ERROR),
+)
 
 DEFAULT_MSG = {
     ResponseCode.UNAUTHENTICATED: '未登录或登录已过期',
     ResponseCode.CREDENTIALS_INVALID: '账号或密码错误',
+    ResponseCode.ACCOUNT_DISABLED: '账号已被禁用',
     ResponseCode.FORBIDDEN: '无操作权限',
     ResponseCode.NOT_FOUND: '资源不存在',
     ResponseCode.PARAM_INVALID: '参数校验失败',
 }
+
+
+def delete_or_block(instance, label: str) -> None:
+    """删除被业务数据引用的对象时，返回明确业务提示而不是 500。"""
+    try:
+        instance.delete()
+    except ProtectedError as exc:
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID,
+            f'{label}已被其他业务数据引用，无法删除；请先停用或解除关联',
+        ) from exc
 
 
 def _flatten_error(data) -> str:
@@ -79,11 +98,15 @@ def custom_exception_handler(exc, context):
         )
 
     code = ResponseCode.SYSTEM_ERROR
-    for exc_class, mapped in CODE_MAP.items():
+    for exc_class, mapped in CODE_MAP:
         if isinstance(exc, exc_class):
             code = mapped
             break
 
-    msg = _flatten_error(getattr(response, 'data', None)) or DEFAULT_MSG.get(code, message_of(int(code)))
+    if isinstance(exc, (InvalidToken, TokenError, exceptions.NotAuthenticated)) and code in DEFAULT_MSG:
+        # 无效/过期 token 统一中文提示，不向前端暴露英文原始信息
+        msg = DEFAULT_MSG[code]
+    else:
+        msg = _flatten_error(getattr(response, 'data', None)) or DEFAULT_MSG.get(code, message_of(int(code)))
     response.data = envelope(code, msg, None, trace_id)
     return response

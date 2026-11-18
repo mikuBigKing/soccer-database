@@ -2,8 +2,10 @@
 from django.urls import path
 
 from .views_school import (
+    SchoolAthleteListView,
     SchoolAthleteVerifyView,
     SchoolAuditLogListView,
+    SchoolCoachListView,
     SchoolCoachVerifyView,
     SchoolNotificationListView,
     SchoolStatisticsView,
@@ -11,7 +13,9 @@ from .views_school import (
 
 urlpatterns = [
     # 实名审核
+    path('coaches', SchoolCoachListView.as_view()),
     path('coaches/<int:pk>/verify', SchoolCoachVerifyView.as_view()),
+    path('athletes', SchoolAthleteListView.as_view()),
     path('athletes/<int:pk>/verify', SchoolAthleteVerifyView.as_view()),
 
     # 本校统计

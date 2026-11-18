@@ -6,13 +6,24 @@ from apps.common.formatting import mask_id_card
 
 from .models import Competition, Registration, RegistrationLog
 
+# 已进入审核流程的状态才使用名单快照；草稿/驳回态展示实时名单便于修改
+SNAPSHOT_STATUSES = (
+    Registration.Status.SUBMITTED,
+    Registration.Status.CITY_APPROVED,
+    Registration.Status.REPORTED,
+    Registration.Status.APPROVED,
+)
+
 
 class CompetitionSerializer(serializers.ModelSerializer):
     status_display = serializers.CharField(source='get_status_display', read_only=True)
 
     class Meta:
         model = Competition
-        fields = ('id', 'name', 'year', 'status', 'status_display', 'created_at')
+        fields = (
+            'id', 'name', 'year', 'status', 'status_display',
+            'sign_up_start_at', 'sign_up_end_at', 'group_types', 'created_at',
+        )
         read_only_fields = ('created_at',)
 
 
@@ -42,6 +53,9 @@ class RegistrationListSerializer(serializers.ModelSerializer):
         )
 
     def get_player_count(self, obj):
+        # 已提交报名优先使用名单快照，保证历史报名人数不随后续人员变动
+        if obj.status in SNAPSHOT_STATUSES and getattr(obj, 'players_snapshot', None):
+            return len(obj.players_snapshot)
         # 列表查询时由 queryset 注解注入，避免 N+1；详情等单对象场景回退到 count 查询
         if hasattr(obj, 'player_count'):
             return obj.player_count
@@ -107,10 +121,16 @@ class RegistrationDetailSerializer(RegistrationListSerializer):
         )
 
     def get_coach(self, obj):
+        # 已提交报名使用教练信息快照
+        if obj.status in SNAPSHOT_STATUSES and obj.coach_snapshot:
+            return obj.coach_snapshot
         profile = CoachProfile.objects.filter(user=obj.team.coach).first()
         return CoachMaterialSerializer(profile).data if profile else None
 
     def get_players(self, obj):
+        # 已提交报名使用名单快照，避免球队名单后续变更改写历史报名内容
+        if obj.status in SNAPSHOT_STATUSES and obj.players_snapshot:
+            return obj.players_snapshot
         athletes = AthleteProfile.objects.filter(team=obj.team).order_by('jersey_no', 'id')
         return PlayerMaterialSerializer(athletes, many=True).data
 

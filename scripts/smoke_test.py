@@ -23,6 +23,7 @@ django.setup()
 from apps.accounts.models import AthleteProfile, User, UserRole  # noqa: E402
 from apps.live.models import Match, MatchStatus  # noqa: E402
 from apps.org.models import City, GroupType, School, Team, TeamStatus  # noqa: E402
+from apps.registration.models import Competition, Registration  # noqa: E402
 
 PASSED = []
 FAILED = []
@@ -84,8 +85,17 @@ def fixture():
     opponent.status = TeamStatus.APPROVED
     opponent.save()
 
+    competition, _ = Competition.objects.get_or_create(name='四川省青少年足球联赛', year=2026)
+    Registration.objects.get_or_create(
+        competition=competition, team=team, defaults={'status': Registration.Status.APPROVED},
+    )
+    Registration.objects.get_or_create(
+        competition=competition, team=opponent, defaults={'status': Registration.Status.APPROVED},
+    )
+
     Match.all_objects.all().delete()
     Match.objects.create(
+        competition=competition,
         group_type=GroupType.MIDDLE_SCHOOL,
         home_team_name=team.name, away_team_name=opponent.name,
         home_team=team, away_team=opponent,
@@ -93,6 +103,7 @@ def fixture():
         status=MatchStatus.FINISHED, home_score=2, away_score=1,
     )
     Match.objects.create(
+        competition=competition,
         group_type=GroupType.MIDDLE_SCHOOL,
         home_team_name=opponent.name, away_team_name=team.name,
         home_team=opponent, away_team=team,
@@ -193,6 +204,14 @@ def main():
     check('创建比赛', body.get('code') == 0, str(body)[:200])
     match_id = body.get('data', {}).get('id')
     version = body.get('data', {}).get('version')
+
+    # 文件上传需要一个未结束的比赛（已结束比赛会被锁定）
+    status, body = api('POST', '/api/admin/live/matches', token=admin_token, json={
+        'group_type': 'middle_school', 'home_team_name': 'C队', 'away_team_name': 'D队',
+        'match_time': '2026-11-02T15:00:00+08:00', 'venue': '文件测试场地',
+    })
+    check('创建文件测试比赛', body.get('code') == 0, str(body)[:200])
+    file_match_id = body.get('data', {}).get('id')
 
     status, body = api('PUT', f'/api/admin/live/matches/{match_id}', token=admin_token, json={
         'version': 999, 'venue': '改场地',
@@ -302,11 +321,11 @@ def main():
     check('已结束不能再开始(40002)', body.get('code') == 40002, str(body)[:200])
 
     print('== 8. 文件上传 ==')
-    status, body = api('POST', f'/api/admin/live/matches/{match_id}/files', token=admin_token,
+    status, body = api('POST', f'/api/admin/live/matches/{file_match_id}/files', token=admin_token,
                        files={'file': ('签到表.txt', b'hello', 'text/plain')}, data={'type': 'sign_in'})
     check('非法格式(10006)', body.get('code') == 10006, str(body)[:200])
 
-    status, body = api('POST', f'/api/admin/live/matches/{match_id}/files', token=admin_token,
+    status, body = api('POST', f'/api/admin/live/matches/{file_match_id}/files', token=admin_token,
                        files={'file': ('签到表.pdf', b'%PDF-1.4 test', 'application/pdf')}, data={'type': 'sign_in'})
     check('上传 PDF 成功', body.get('code') == 0, str(body)[:200])
     file_id = body.get('data', {}).get('id')
@@ -315,7 +334,7 @@ def main():
                             headers={'Authorization': f'Bearer {admin_token}'}, timeout=10)
     check('下载文件', response.status_code == 200 and response.content.startswith(b'%PDF'), f'status={response.status_code}')
 
-    status, body = api('GET', f'/api/admin/live/matches/{match_id}/files', token=admin_token)
+    status, body = api('GET', f'/api/admin/live/matches/{file_match_id}/files', token=admin_token)
     check('文件列表', body.get('code') == 0 and len(body.get('data') or []) == 1, str(body)[:200])
 
     print('== 9. 运动员端 ==')

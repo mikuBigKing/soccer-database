@@ -30,7 +30,8 @@ class Province(models.Model):
 
 
 class City(models.Model):
-    province = models.ForeignKey(Province, on_delete=models.CASCADE, related_name='cities')
+    # 行政区划被引用后禁止物理删除，避免级联清空学校/球队/报名历史
+    province = models.ForeignKey(Province, on_delete=models.PROTECT, related_name='cities')
     name = models.CharField('城市名称', max_length=50)
     code = models.CharField('行政区划编码', max_length=20)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -50,7 +51,7 @@ class School(models.Model):
         ACTIVE = 'active', '正常'
         DISABLED = 'disabled', '已停用'
 
-    city = models.ForeignKey(City, on_delete=models.CASCADE, related_name='schools')
+    city = models.ForeignKey(City, on_delete=models.PROTECT, related_name='schools')
     county = models.CharField('所属区县', max_length=50, null=True, blank=True)
     name = models.CharField('学校名称', max_length=150)
     logo = models.CharField('Logo 路径', max_length=255, null=True, blank=True)
@@ -73,8 +74,8 @@ class School(models.Model):
 
 
 class Team(models.Model):
-    school = models.ForeignKey(School, on_delete=models.CASCADE, related_name='teams')
-    coach = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='coached_teams')
+    school = models.ForeignKey(School, on_delete=models.PROTECT, related_name='teams')
+    coach = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.PROTECT, related_name='coached_teams')
     name = models.CharField('球队名称', max_length=150)
     logo = models.CharField('Logo 路径', max_length=255, null=True, blank=True)
     group_type = models.CharField('组别', max_length=30, choices=GroupType.choices)

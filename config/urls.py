@@ -23,6 +23,8 @@ urlpatterns = [
     path('api/admin/live/', include('apps.live.urls_admin')),
     path('api/school/live/', include('apps.live.urls_school')),
     path('api/school/', include('apps.registration.urls_school')),
+    path('api/school/', include('apps.org.urls_school')),
+    path('api/coach/', include('apps.org.urls_coach')),
     path('api/admin/', include('apps.org.urls')),
     path('api/', include('apps.org.urls_city')),
     path('api/athlete/', include('apps.athlete.urls')),

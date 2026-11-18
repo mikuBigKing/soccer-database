@@ -2,6 +2,7 @@
 import io
 import logging
 import os
+import posixpath
 import uuid
 
 from django.conf import settings
@@ -11,11 +12,56 @@ from apps.accounts.models import AthleteProfile, CoachProfile, ProfileStatus, Us
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.formatting import mask_id_card
-from apps.org.models import Team
+from apps.org.models import Team, TeamStatus
 
 from .models import Competition, Registration, RegistrationLog
 
 business_logger = logging.getLogger('business')
+
+
+def _private_path(relative_path: str) -> str:
+    """私有目录相对路径（统一 POSIX）转绝对路径，兼容历史反斜杠数据。"""
+    normalized = str(relative_path).replace('\\', '/')
+    return os.path.join(str(settings.PRIVATE_STORAGE_ROOT), *normalized.split('/'))
+
+
+def _snapshot_players(team: Team) -> list[dict]:
+    """生成球员名单快照（字段与 PlayerMaterialSerializer 输出一致）。"""
+    rows = []
+    for profile in AthleteProfile.objects.filter(team=team).order_by('jersey_no', 'id'):
+        rows.append({
+            'id': profile.pk,
+            'user_id': profile.user_id,
+            'name': profile.name,
+            'jersey_no': profile.jersey_no,
+            'position': profile.position,
+            'id_card': mask_id_card(profile.id_card),
+            'has_enrollment_cert': bool(profile.enrollment_cert_path),
+            'has_avatar': bool(profile.avatar_path),
+            'enrollment_cert_name': profile.enrollment_cert_name,
+            'avatar_name': profile.avatar_name,
+            'status': profile.status,
+            'reject_reason': profile.reject_reason,
+        })
+    return rows
+
+
+def _snapshot_coach(team: Team) -> dict | None:
+    """生成教练信息快照（字段与 CoachMaterialSerializer 输出一致）。"""
+    profile = CoachProfile.objects.filter(user=team.coach).first()
+    if profile is None:
+        return None
+    return {
+        'id': profile.pk,
+        'user_id': profile.user_id,
+        'name': profile.name,
+        'phone': profile.phone,
+        'id_card': mask_id_card(profile.id_card),
+        'has_qualification': bool(profile.qualification_path),
+        'qualification_name': profile.qualification_name,
+        'status': profile.status,
+        'reject_reason': profile.reject_reason,
+    }
 
 
 def write_log(action: str, actor, registration: Registration = None, detail: dict = None) -> None:
@@ -38,25 +84,27 @@ class MaterialService:
     SCAN_EXTS = {'.pdf', '.jpg', '.jpeg', '.png'}
     IMAGE_EXTS = {'.jpg', '.jpeg', '.png'}
 
-    def save(self, relative_dir: str, uploaded_file, allowed_exts) -> tuple[str, str]:
+    def save(self, relative_dir: str, uploaded_file, allowed_exts, max_size: int = None) -> tuple[str, str]:
         name = uploaded_file.name or 'file'
         ext = os.path.splitext(name)[1].lower()
         if ext not in allowed_exts:
             raise BusinessException(ResponseCode.FILE_TYPE_INVALID)
-        if uploaded_file.size > settings.MAX_FILE_SIZE:
+        limit = max_size if max_size is not None else settings.MAX_FILE_SIZE
+        if uploaded_file.size > limit:
             raise BusinessException(ResponseCode.FILE_SIZE_EXCEEDED)
 
-        absolute_dir = os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_dir)
+        relative_dir = str(relative_dir).replace('\\', '/')
+        absolute_dir = self.absolute_path(relative_dir)
         os.makedirs(absolute_dir, exist_ok=True)
         stored_name = f'{uuid.uuid4().hex}{ext}'
-        relative_path = os.path.join(relative_dir, stored_name)
-        with open(os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_path), 'wb') as target:
+        relative_path = posixpath.join(relative_dir, stored_name)
+        with open(self.absolute_path(relative_path), 'wb') as target:
             for chunk in uploaded_file.chunks():
                 target.write(chunk)
         return relative_path, name
 
     def absolute_path(self, relative_path: str) -> str:
-        return os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_path)
+        return _private_path(relative_path)
 
     def remove_quietly(self, relative_path: str) -> None:
         if not relative_path:
@@ -157,17 +205,32 @@ class RegistrationService:
 
     # ---------- 提交方 ----------
 
+    def _validate_competition_team(self, competition: Competition, team: Team, user) -> None:
+        """创建/修改报名单的公共校验：时间窗、组别、球队审核状态、数据范围。"""
+        if competition.status != Competition.Status.OPEN:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该赛事报名已截止')
+        now = timezone.now()
+        if competition.sign_up_start_at and now < competition.sign_up_start_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该赛事报名尚未开始')
+        if competition.sign_up_end_at and now > competition.sign_up_end_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该赛事报名已截止')
+        if team.pk not in _submitter_team_ids(user):
+            raise BusinessException(ResponseCode.FORBIDDEN, '仅可为本校/本队球队报名')
+        if competition.group_types and team.group_type not in competition.group_types:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该赛事不接收此组别的球队')
+        if team.status != TeamStatus.APPROVED:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '球队尚未通过校级审核，暂不可报名')
+
     def create_draft(self, user, competition_id: int, team_id: int) -> Registration:
         competition = Competition.objects.filter(pk=competition_id).first()
         if competition is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '赛事不存在', status_code=404)
-        if competition.status != Competition.Status.OPEN:
-            raise BusinessException(ResponseCode.PARAM_INVALID, '该赛事报名已截止')
         if team_id not in _submitter_team_ids(user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可为本校/本队球队报名')
         team = Team.objects.filter(pk=team_id).select_related('school').first()
         if team is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '球队不存在', status_code=404)
+        self._validate_competition_team(competition, team, user)
         if Registration.objects.filter(competition=competition, team=team).exists():
             raise BusinessException(ResponseCode.DUPLICATE_SUBMIT, '该球队在此赛事下已有报名单')
 
@@ -177,21 +240,91 @@ class RegistrationService:
         write_log(RegistrationLog.Action.CREATE, user, registration, {'team_id': team_id})
         return registration
 
+    def update_draft(self, user, registration: Registration, competition_id: int = None,
+                     team_id: int = None) -> Registration:
+        """修改报名单：仅草稿/被驳回状态可改；改动后回到草稿重新提交。"""
+        if registration.team_id not in _submitter_team_ids(user):
+            raise BusinessException(ResponseCode.FORBIDDEN, '仅可修改本校/本队的报名单')
+        if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
+            raise BusinessException(ResponseCode.PARAM_INVALID, '审核中或已通过的报名单不可修改')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可修改')
+
+        competition = registration.competition
+        team = registration.team
+        if competition_id is not None:
+            competition = Competition.objects.filter(pk=competition_id).first()
+            if competition is None:
+                raise BusinessException(ResponseCode.NOT_FOUND, '赛事不存在', status_code=404)
+        if team_id is not None:
+            team = Team.objects.filter(pk=team_id).select_related('school').first()
+            if team is None:
+                raise BusinessException(ResponseCode.NOT_FOUND, '球队不存在', status_code=404)
+        self._validate_competition_team(competition, team, user)
+        if Registration.objects.filter(competition=competition, team=team).exclude(pk=registration.pk).exists():
+            raise BusinessException(ResponseCode.DUPLICATE_SUBMIT, '该球队在此赛事下已有报名单')
+
+        changed = []
+        if competition.pk != registration.competition_id:
+            registration.competition = competition
+            changed.append('competition')
+        if team.pk != registration.team_id:
+            registration.team = team
+            changed.append('team')
+        if changed or registration.status == Registration.Status.REJECTED:
+            registration.status = Registration.Status.DRAFT
+            registration.reject_level = None
+            registration.reject_reason = None
+            registration.save()
+            write_log(RegistrationLog.Action.UPDATE, user, registration,
+                      {'changed': changed, 'competition_id': competition.pk, 'team_id': team.pk})
+        return registration
+
+    def delete_draft(self, user, registration: Registration) -> None:
+        """删除报名单：仅草稿/被驳回状态可删，已提交数据保留审计。"""
+        if registration.team_id not in _submitter_team_ids(user):
+            raise BusinessException(ResponseCode.FORBIDDEN, '仅可删除本校/本队的报名单')
+        if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
+            raise BusinessException(ResponseCode.PARAM_INVALID, '审核中或已通过的报名单不可删除')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可删除')
+        registration_id = registration.pk
+        self.materials.remove_quietly(registration.stamped_form_path)
+        write_log(RegistrationLog.Action.DELETE, user, None,
+                  {'registration_id': registration_id, 'team_id': registration.team_id})
+        registration.delete()
+
     def submit(self, user, registration: Registration) -> Registration:
         if registration.team_id not in _submitter_team_ids(user):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可提交本校/本队的报名单')
         if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
             raise BusinessException(ResponseCode.PARAM_INVALID, '当前状态不可提交')
+        if registration.archived_at:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '报名单已归档，不可提交')
         completeness = check_completeness(registration)
         if not completeness['complete']:
             raise BusinessException(ResponseCode.PARAM_INVALID,
                                     '报名资料不完整：' + '；'.join(completeness['missing']))
 
+        # 提交时冻结名单快照，后续球队人员变更不影响历史报名
+        registration.players_snapshot = _snapshot_players(registration.team)
+        registration.coach_snapshot = _snapshot_coach(registration.team) or {}
         registration.status = Registration.Status.SUBMITTED
         registration.reject_level = None
         registration.reject_reason = None
         registration.submitted_at = timezone.now()
-        registration.save(update_fields=['status', 'reject_level', 'reject_reason', 'submitted_at', 'updated_at'])
+        # 新一轮审核开始：清空上一轮各阶段审核元数据，避免页面显示旧审核时间
+        registration.city_reviewed_by = None
+        registration.city_reviewed_at = None
+        registration.reported_by = None
+        registration.reported_at = None
+        registration.province_reviewed_by = None
+        registration.province_reviewed_at = None
+        registration.save(update_fields=[
+            'players_snapshot', 'coach_snapshot', 'status', 'reject_level', 'reject_reason',
+            'submitted_at', 'city_reviewed_by', 'city_reviewed_at', 'reported_by', 'reported_at',
+            'province_reviewed_by', 'province_reviewed_at', 'updated_at',
+        ])
         write_log(RegistrationLog.Action.SUBMIT, user, registration)
         return registration
 
@@ -203,10 +336,16 @@ class RegistrationService:
         if registration.status not in (Registration.Status.DRAFT, Registration.Status.REJECTED):
             raise BusinessException(ResponseCode.PARAM_INVALID, '审核中或已通过的报名单不可更换扫描件')
         path, name = self.materials.save(f'registrations/{registration.pk}', uploaded_file, MaterialService.SCAN_EXTS)
-        self.materials.remove_quietly(registration.stamped_form_path)
+        old_path = registration.stamped_form_path
         registration.stamped_form_path = path
         registration.stamped_form_name = name
-        registration.save(update_fields=['stamped_form_path', 'stamped_form_name', 'updated_at'])
+        try:
+            registration.save(update_fields=['stamped_form_path', 'stamped_form_name', 'updated_at'])
+        except Exception:
+            # 数据库写入失败时清理新文件，避免孤儿文件
+            self.materials.remove_quietly(path)
+            raise
+        self.materials.remove_quietly(old_path)
         write_log(RegistrationLog.Action.MATERIAL_UPLOAD, user, registration, {'material': 'stamped_form', 'name': name})
         return registration
 
@@ -243,8 +382,12 @@ class RegistrationService:
             action = RegistrationLog.Action.CITY_REJECT
         registration.city_reviewed_by = user.pk
         registration.city_reviewed_at = timezone.now()
+        # 进入省级阶段前清空上一轮省级审核痕迹
+        registration.province_reviewed_by = None
+        registration.province_reviewed_at = None
         registration.save(update_fields=[
-            'status', 'reject_level', 'reject_reason', 'city_reviewed_by', 'city_reviewed_at', 'updated_at',
+            'status', 'reject_level', 'reject_reason', 'city_reviewed_by', 'city_reviewed_at',
+            'province_reviewed_by', 'province_reviewed_at', 'updated_at',
         ])
         write_log(action, user, registration, {'reason': reason} if reason else {})
         return registration
@@ -256,7 +399,12 @@ class RegistrationService:
         registration.status = Registration.Status.REPORTED
         registration.reported_by = user.pk
         registration.reported_at = timezone.now()
-        registration.save(update_fields=['status', 'reported_by', 'reported_at', 'updated_at'])
+        registration.province_reviewed_by = None
+        registration.province_reviewed_at = None
+        registration.save(update_fields=[
+            'status', 'reported_by', 'reported_at',
+            'province_reviewed_by', 'province_reviewed_at', 'updated_at',
+        ])
         write_log(RegistrationLog.Action.REPORT, user, registration)
         return registration
 
@@ -268,7 +416,15 @@ class RegistrationService:
                 done.append(pk)
             except BusinessException as exc:
                 failed.append({'id': pk, 'msg': exc.msg})
-        return {'reported': done, 'failed': failed}
+        return {
+            'reported': done,
+            'failed': failed,
+            'total': len(ids),
+            'success_count': len(done),
+            'failed_count': len(failed),
+            # 部分成功时前端需逐条展示 failed，不能只提示成功
+            'partial': bool(done and failed),
+        }
 
     def archive(self, user, registration: Registration) -> Registration:
         """报名资料归档：归档后资料锁定，不可再上传/修改。"""
@@ -362,8 +518,17 @@ class ExportService:
         team = registration.team
         school = team.school
         city = school.city
-        coach = CoachProfile.objects.filter(user=team.coach).first()
-        athletes = AthleteProfile.objects.filter(team=team).order_by('jersey_no', 'id')
+        # 优先使用提交时冻结的名单快照，保证历史报名表内容不被后续改动；
+        # 草稿/驳回态仍展示实时名单，便于提交方继续修改。
+        snapshot_statuses = (
+            Registration.Status.SUBMITTED,
+            Registration.Status.CITY_APPROVED,
+            Registration.Status.REPORTED,
+            Registration.Status.APPROVED,
+        )
+        use_snapshot = registration.status in snapshot_statuses
+        coach = (registration.coach_snapshot if use_snapshot else None) or _snapshot_coach(team) or {}
+        players = (registration.players_snapshot if use_snapshot else None) or _snapshot_players(team)
 
         doc = Document()
         doc.add_heading(f'{registration.competition.name} 报名表', level=0)
@@ -372,8 +537,8 @@ class ExportService:
         doc.add_paragraph(f'球队：{team.name}    组别：{team.get_group_type_display()}')
         if coach:
             doc.add_paragraph(
-                f'教练员：{coach.name}    联系电话：{coach.phone or ""}    '
-                f'身份证号：{mask_id_card(coach.id_card) or ""}'
+                f'教练员：{coach.get("name") or ""}    联系电话：{coach.get("phone") or ""}    '
+                f'身份证号：{coach.get("id_card") or ""}'
             )
         doc.add_paragraph(f'报名状态：{registration.get_status_display()}    提交时间：'
                           f'{timezone.localtime(registration.submitted_at).strftime("%Y-%m-%d %H:%M") if registration.submitted_at else ""}')
@@ -383,13 +548,13 @@ class ExportService:
         table.style = 'Table Grid'
         for cell, text in zip(table.rows[0].cells, ['球衣号', '姓名', '身份证号', '位置', '学籍材料']):
             cell.text = text
-        for a in athletes:
+        for player in players:
             row = table.add_row().cells
-            row[0].text = str(a.jersey_no or '')
-            row[1].text = a.name
-            row[2].text = mask_id_card(a.id_card) or ''
-            row[3].text = a.position or ''
-            row[4].text = '已上传' if a.enrollment_cert_path else '未上传'
+            row[0].text = str(player.get('jersey_no') or '')
+            row[1].text = player.get('name') or ''
+            row[2].text = player.get('id_card') or ''
+            row[3].text = player.get('position') or ''
+            row[4].text = '已上传' if player.get('has_enrollment_cert') else '未上传'
 
         buffer = io.BytesIO()
         doc.save(buffer)

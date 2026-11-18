@@ -3,10 +3,11 @@
 输出字段严格对齐前端 `src/features/live/types/live.ts`（该文件由 Laravel Resource 推导），
 命名统一为 `*_label`，`match_time` 与审计时间为 `Y-m-d H:i:s`。
 """
+from django.conf import settings
 from rest_framework import serializers
 
 from apps.common.formatting import format_dt
-from apps.org.models import GroupType
+from apps.org.models import GroupType, Team
 
 from .models import (
     EventType,
@@ -27,17 +28,23 @@ class MatchListSerializer(serializers.ModelSerializer):
     group_type_label = serializers.CharField(source='get_group_type_display', read_only=True)
     status_label = serializers.CharField(source='get_status_display', read_only=True)
     match_time = serializers.SerializerMethodField()
+    competition_id = serializers.IntegerField(read_only=True)
+    competition_name = serializers.SerializerMethodField()
 
     class Meta:
         model = Match
         fields = (
-            'id', 'group_type', 'group_type_label', 'home_team_name', 'away_team_name',
+            'id', 'competition_id', 'competition_name', 'group_type', 'group_type_label',
+            'home_team_name', 'away_team_name',
             'home_team_logo', 'away_team_logo', 'match_time', 'venue',
             'status', 'status_label', 'home_score', 'away_score',
         )
 
     def get_match_time(self, obj):
         return format_dt(obj.match_time)
+
+    def get_competition_name(self, obj):
+        return obj.competition.name if obj.competition_id else None
 
 
 class MatchDetailSerializer(MatchListSerializer):
@@ -136,8 +143,39 @@ class MatchStoreSerializer(serializers.Serializer):
     away_team_logo = serializers.CharField(max_length=255, required=False, allow_null=True, allow_blank=True)
     match_time = serializers.DateTimeField()
     venue = serializers.CharField(max_length=200, required=False, allow_null=True, allow_blank=True)
+    competition_id = serializers.IntegerField(required=False, allow_null=True)
     home_team_id = serializers.IntegerField(required=False, allow_null=True)
     away_team_id = serializers.IntegerField(required=False, allow_null=True)
+
+    def validate_competition_id(self, value):
+        if value is None:
+            return value
+        from apps.registration.models import Competition
+
+        if not Competition.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('赛事不存在')
+        return value
+
+    def validate_home_team_id(self, value):
+        if value is None:
+            return value
+        if not Team.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('主队不存在')
+        return value
+
+    def validate_away_team_id(self, value):
+        if value is None:
+            return value
+        if not Team.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('客队不存在')
+        return value
+
+    def validate(self, attrs):
+        home = attrs.get('home_team_id')
+        away = attrs.get('away_team_id')
+        if home and away and home == away:
+            raise serializers.ValidationError({'away_team_id': '主队与客队不能相同'})
+        return attrs
 
 
 class MatchUpdateSerializer(MatchStoreSerializer):
@@ -145,8 +183,10 @@ class MatchUpdateSerializer(MatchStoreSerializer):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        for field in self.fields.values():
-            field.required = False
+        # version 作为乐观锁必填，其余业务字段可部分更新
+        for name, field in self.fields.items():
+            if name != 'version':
+                field.required = False
 
 
 class MatchStatusSerializer(serializers.Serializer):
@@ -178,6 +218,23 @@ class EventStoreSerializer(serializers.Serializer):
     client_token = serializers.CharField(max_length=64)
     athlete_id = serializers.IntegerField(required=False, allow_null=True)
 
+    def validate_player_no(self, value):
+        if value in (None, ''):
+            return value
+        text = str(value).strip()
+        if not text.isdigit() or not 0 <= int(text) <= 99:
+            raise serializers.ValidationError('球衣号必须为 0-99 的数字')
+        return str(int(text))
+
+    def validate_athlete_id(self, value):
+        if value is None:
+            return value
+        from apps.accounts.models import AthleteProfile
+
+        if not AthleteProfile.objects.filter(pk=value).exists():
+            raise serializers.ValidationError('运动员不存在')
+        return value
+
     def validate(self, attrs):
         event_type = attrs.get('type')
         if event_type != EventType.TEXT:
@@ -193,10 +250,10 @@ class EventStoreSerializer(serializers.Serializer):
 
 
 class EventUpdateSerializer(EventStoreSerializer):
-    client_token = serializers.CharField(max_length=64, required=False)
-
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # 更新不允许修改幂等键（F-06）
+        self.fields.pop('client_token', None)
         for field in self.fields.values():
             field.required = False
 
@@ -227,3 +284,8 @@ class FaceVerifySerializer(serializers.Serializer):
     player_name = serializers.CharField(max_length=50)
     player_no = serializers.CharField(max_length=16, required=False, allow_null=True, allow_blank=True)
     photo = serializers.ImageField()
+
+    def validate_photo(self, value):
+        if value.size > settings.MAX_IMAGE_SIZE:
+            raise serializers.ValidationError('图片大小超出限制')
+        return value

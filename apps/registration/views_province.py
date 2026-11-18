@@ -26,6 +26,7 @@
 """
 from urllib.parse import quote
 
+from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db.models import Count, Q
 from django.http import HttpResponse
@@ -33,11 +34,13 @@ from rest_framework import serializers
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from apps.accounts.validators import ensure_id_card_unique
 from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, CountyProfile, ProfileStatus, ProvinceProfile, SchoolProfile, UserRole
 from apps.common.codes import ResponseCode
-from apps.common.exceptions import BusinessException
+from apps.common.exceptions import BusinessException, delete_or_block
 from apps.common.pagination import paginated_response
 from apps.common.permissions import SCHOOL_ADMIN_PERMISSIONS, is_admin, role_permission
+from apps.org.models import City, GroupType, Province, School, Team
 from apps.registration.models import Registration, RegistrationLog
 from apps.registration.serializers import (
     CoachMaterialSerializer,
@@ -61,9 +64,8 @@ User = get_user_model()
 
 ProvinceOnly = role_permission('province')
 
-# 报名账号管理的角色范围：市州/区县/校级/省级/管理员账号
-MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.COUNTY, UserRole.SCHOOL,
-                         UserRole.PROVINCE, UserRole.ADMIN)
+# 报名账号管理的角色范围：市州/区县/校级/省级账号（管理员账号不属于省级管理范围）
+MANAGED_ACCOUNT_ROLES = (UserRole.CITY, UserRole.COUNTY, UserRole.SCHOOL, UserRole.PROVINCE)
 
 
 # ---------------- 报名审核 ----------------
@@ -162,11 +164,13 @@ class ProvinceStatisticsView(APIView):
             queryset = queryset.filter(competition_id=competition_id)
 
         status_annotations = {s: Count('id', filter=Q(status=s)) for s, _ in Registration.Status.choices}
+        group_labels = dict(GroupType.choices)
 
-        def expand(rows, key_fields):
+        def expand(rows, mapping):
+            """把 ORM 原始字段名转换为稳定业务字段，减少前端二次映射。"""
             result = []
             for row in rows:
-                item = {key: row[key] for key in key_fields}
+                item = {friendly: row[raw] for friendly, raw in mapping.items()}
                 item['total'] = row['total']
                 for s, _ in Registration.Status.choices:
                     item[s] = row.get(s, 0)
@@ -177,20 +181,22 @@ class ProvinceStatisticsView(APIView):
             queryset.values('team__school__city_id', 'team__school__city__name')
             .annotate(total=Count('id')).annotate(**status_annotations)
             .order_by('team__school__city_id'),
-            ('team__school__city_id', 'team__school__city__name'),
+            {'city_id': 'team__school__city_id', 'city_name': 'team__school__city__name'},
         )
         by_group = expand(
             queryset.values('team__group_type')
             .annotate(total=Count('id')).annotate(**status_annotations)
             .order_by('team__group_type'),
-            ('team__group_type',),
+            {'group_type': 'team__group_type'},
         )
+        for item in by_group:
+            item['group_type_label'] = group_labels.get(item['group_type'], item['group_type'])
         university_by_school = expand(
             queryset.filter(team__group_type='university')
             .values('team__school_id', 'team__school__name')
             .annotate(total=Count('id')).annotate(**status_annotations)
             .order_by('team__school_id'),
-            ('team__school_id', 'team__school__name'),
+            {'school_id': 'team__school_id', 'school_name': 'team__school__name'},
         )
 
         # 球队维度：每支参赛球队的报名状态
@@ -201,9 +207,16 @@ class ProvinceStatisticsView(APIView):
             )
             .annotate(total=Count('id')).annotate(**status_annotations)
             .order_by('team__school__city_id', 'team_id'),
-            ('team_id', 'team__name', 'team__school__name',
-             'team__school__city__name', 'team__group_type'),
+            {
+                'team_id': 'team_id',
+                'team_name': 'team__name',
+                'school_name': 'team__school__name',
+                'city_name': 'team__school__city__name',
+                'group_type': 'team__group_type',
+            },
         )
+        for item in by_team:
+            item['group_type_label'] = group_labels.get(item['group_type'], item['group_type'])
 
         # 球员维度：按市州统计球员总数与实名认证状态分布
         athlete_qs = AthleteProfile.objects.all()
@@ -297,6 +310,10 @@ class ProvinceCoachDetailView(APIView):
             raise BusinessException(ResponseCode.NOT_FOUND, '教练不存在', status_code=404)
         serializer = CoachUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        if 'id_card' in serializer.validated_data:
+            serializer.validated_data['id_card'] = ensure_id_card_unique(
+                serializer.validated_data['id_card'], coach_pk=profile.pk
+            )
         changed = {}
         for field, value in serializer.validated_data.items():
             if getattr(profile, field) != value:
@@ -370,6 +387,19 @@ class ProvinceAthleteDetailView(APIView):
             raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
         serializer = AthleteUpdateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        if 'id_card' in data:
+            data['id_card'] = ensure_id_card_unique(data['id_card'], athlete_pk=profile.pk)
+        team_id = data.get('team_id', profile.team_id)
+        if 'team_id' in data and team_id and not Team.objects.filter(pk=team_id).exists():
+            raise BusinessException(ResponseCode.NOT_FOUND, '球队不存在', status_code=404)
+        jersey_no = data.get('jersey_no', profile.jersey_no)
+        if jersey_no is not None and team_id:
+            duplicated = AthleteProfile.objects.filter(
+                team_id=team_id, jersey_no=jersey_no
+            ).exclude(pk=profile.pk).exists()
+            if duplicated:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '该球队内球衣号已被占用')
         changed = {}
         for field, value in serializer.validated_data.items():
             if getattr(profile, field) != value:
@@ -426,11 +456,18 @@ class ProvinceAthleteAvatarView(APIView):
         if profile is None:
             raise BusinessException(ResponseCode.NOT_FOUND, '球员不存在', status_code=404)
         service = MaterialService()
-        path, name = service.save(f'avatars/{profile.pk}', uploaded, MaterialService.IMAGE_EXTS)
-        service.remove_quietly(profile.avatar_path)
+        path, name = service.save(
+            f'avatars/{profile.pk}', uploaded, MaterialService.IMAGE_EXTS, max_size=settings.MAX_IMAGE_SIZE,
+        )
+        old_path = profile.avatar_path
         profile.avatar_path = path
         profile.avatar_name = name
-        profile.save(update_fields=['avatar_path', 'avatar_name', 'updated_at'])
+        try:
+            profile.save(update_fields=['avatar_path', 'avatar_name', 'updated_at'])
+        except Exception:
+            service.remove_quietly(path)
+            raise
+        service.remove_quietly(old_path)
         write_log(RegistrationLog.Action.AVATAR_UPLOAD, request.user, None,
                   {'athlete_id': profile.pk, 'name': name})
         return Response(PlayerMaterialSerializer(profile).data)
@@ -527,6 +564,14 @@ class AccountCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError({'school_id': '校级账号必须选择所属学校'})
         if role == UserRole.PROVINCE and not attrs.get('province_id'):
             raise serializers.ValidationError({'province_id': '省级账号必须选择所属省份'})
+
+        # 外键存在性校验，避免脏 ID 触发数据库 IntegrityError（500）
+        if attrs.get('city_id') and not City.objects.filter(pk=attrs['city_id']).exists():
+            raise serializers.ValidationError({'city_id': '市州不存在'})
+        if attrs.get('province_id') and not Province.objects.filter(pk=attrs['province_id']).exists():
+            raise serializers.ValidationError({'province_id': '省份不存在'})
+        if attrs.get('school_id') and not School.objects.filter(pk=attrs['school_id']).exists():
+            raise serializers.ValidationError({'school_id': '学校不存在'})
         return attrs
 
 
@@ -543,6 +588,31 @@ class AccountUpdateSerializer(serializers.Serializer):
     permissions = serializers.ListField(
         child=serializers.CharField(max_length=100), required=False, allow_empty=True,
     )
+
+    def validate_phone(self, value):
+        queryset = User.objects.filter(phone=value)
+        if self.instance is not None:
+            queryset = queryset.exclude(pk=self.instance.pk)
+        if queryset.exists():
+            raise serializers.ValidationError('该手机号已被使用')
+        return value
+
+    def validate_email(self, value):
+        queryset = User.objects.filter(email__iexact=value)
+        if self.instance is not None:
+            queryset = queryset.exclude(pk=self.instance.pk)
+        if queryset.exists():
+            raise serializers.ValidationError('该邮箱已被使用')
+        return value
+
+    def validate(self, attrs):
+        if attrs.get('city_id') and not City.objects.filter(pk=attrs['city_id']).exists():
+            raise serializers.ValidationError({'city_id': '市州不存在'})
+        if attrs.get('province_id') and not Province.objects.filter(pk=attrs['province_id']).exists():
+            raise serializers.ValidationError({'province_id': '省份不存在'})
+        if attrs.get('school_id') and not School.objects.filter(pk=attrs['school_id']).exists():
+            raise serializers.ValidationError({'school_id': '学校不存在'})
+        return attrs
 
 
 def _get_managed_account(pk: int) -> User:
@@ -617,7 +687,7 @@ class ProvinceAccountDetailView(APIView):
     def put(self, request, pk: int):
         target = _get_managed_account(pk)
         _ensure_admin_role_allowed(request, target.role)
-        serializer = AccountUpdateSerializer(data=request.data)
+        serializer = AccountUpdateSerializer(instance=target, data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
@@ -675,7 +745,8 @@ class ProvinceAccountDetailView(APIView):
         if target.pk == request.user.pk:
             raise BusinessException(ResponseCode.PARAM_INVALID, '不能删除当前登录账号')
         role, name = target.role, target.name
-        target.delete()
+        # 账号被球队/报名等业务数据引用时，PROTECT 会阻止删除并给出业务提示
+        delete_or_block(target, '该账号')
         write_log(RegistrationLog.Action.ACCOUNT_DELETE, request.user, None,
                   {'target_user_id': pk, 'role': role, 'name': name})
         return Response({'id': pk})

@@ -26,6 +26,11 @@ class Competition(models.Model):
     name = models.CharField('赛事名称', max_length=100)
     year = models.PositiveSmallIntegerField('年份')
     status = models.CharField('状态', max_length=20, choices=Status.choices, default=Status.OPEN, db_index=True)
+    # 报名时间窗：为空表示不限制；create_draft 时校验
+    sign_up_start_at = models.DateTimeField('报名开始时间', null=True, blank=True)
+    sign_up_end_at = models.DateTimeField('报名截止时间', null=True, blank=True)
+    # 允许报名的组别（org.GroupType 值列表）；为空表示不限组别
+    group_types = models.JSONField('可报组别', default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -52,8 +57,8 @@ class Registration(models.Model):
         CITY = 'city', '市州驳回'
         PROVINCE = 'province', '省级驳回'
 
-    competition = models.ForeignKey(Competition, on_delete=models.CASCADE, related_name='registrations')
-    team = models.ForeignKey('org.Team', on_delete=models.CASCADE, related_name='registrations')
+    competition = models.ForeignKey(Competition, on_delete=models.PROTECT, related_name='registrations')
+    team = models.ForeignKey('org.Team', on_delete=models.PROTECT, related_name='registrations')
     submitted_by = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='registrations'
     )
@@ -62,6 +67,9 @@ class Registration(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     stamped_form_path = models.CharField('盖章报名表扫描件路径', max_length=255, null=True, blank=True)
     stamped_form_name = models.CharField('盖章报名表扫描件文件名', max_length=255, null=True, blank=True)
+    # 提交时的名单快照：已提交/已审核报名以当时名单为准，后续球队变更不影响历史报名
+    players_snapshot = models.JSONField('球员名单快照', default=list, blank=True)
+    coach_snapshot = models.JSONField('教练信息快照', default=dict, blank=True)
     archived_at = models.DateTimeField('归档时间', null=True, blank=True)
     archived_by = models.BigIntegerField('归档人 user_id', null=True, blank=True)
     submitted_at = models.DateTimeField('提交时间', null=True, blank=True)
@@ -102,6 +110,8 @@ class RegistrationLog(models.Model):
 
     class Action(models.TextChoices):
         CREATE = 'create', '创建报名单'
+        UPDATE = 'update', '修改报名单'
+        DELETE = 'delete', '删除报名单'
         SUBMIT = 'submit', '提交报名'
         CITY_APPROVE = 'city_approve', '市州通过'
         CITY_REJECT = 'city_reject', '市州驳回'
@@ -119,6 +129,10 @@ class RegistrationLog(models.Model):
         IDENTITY_UPDATE = 'identity_update', '身份信息修改'
         IDENTITY_APPROVE = 'identity_approve', '实名认证通过'
         IDENTITY_REJECT = 'identity_reject', '实名认证驳回'
+        TEAM_CREATE = 'team_create', '创建球队'
+        TEAM_UPDATE = 'team_update', '修改球队'
+        TEAM_APPROVE = 'team_approve', '球队审核通过'
+        TEAM_REJECT = 'team_reject', '球队审核驳回'
 
     registration = models.ForeignKey(
         Registration, null=True, blank=True, on_delete=models.SET_NULL, related_name='logs'
@@ -142,7 +156,7 @@ class RegistrationLog(models.Model):
 class SchoolNotification(models.Model):
     """校级通知：面向本校教练与运动员。"""
 
-    school = models.ForeignKey('org.School', on_delete=models.CASCADE, related_name='notifications')
+    school = models.ForeignKey('org.School', on_delete=models.PROTECT, related_name='notifications')
     title = models.CharField('标题', max_length=100)
     content = models.TextField('内容')
     created_by = models.ForeignKey(
@@ -159,7 +173,7 @@ class SchoolNotification(models.Model):
 class SchoolAuditLog(models.Model):
     """校级操作日志：记录校级管理员的关键操作。"""
 
-    school = models.ForeignKey('org.School', on_delete=models.CASCADE, related_name='audit_logs')
+    school = models.ForeignKey('org.School', on_delete=models.PROTECT, related_name='audit_logs')
     actor = models.ForeignKey(
         settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL, related_name='+'
     )

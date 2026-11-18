@@ -8,10 +8,11 @@ MatchFileService / FaceVerifyService）。
 """
 import logging
 import os
+import posixpath
 import uuid
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 
 from apps.common.codes import ResponseCode
@@ -31,14 +32,30 @@ from .models import (
 business_logger = logging.getLogger('business')
 
 
+def private_path(relative_path: str) -> str:
+    """私有目录相对路径（统一 POSIX）转绝对路径，兼容历史反斜杠数据。"""
+    normalized = str(relative_path).replace('\\', '/')
+    return os.path.join(str(settings.PRIVATE_STORAGE_ROOT), *normalized.split('/'))
+
+
+def ensure_dir(relative_dir: str) -> str:
+    absolute_dir = private_path(relative_dir)
+    os.makedirs(absolute_dir, exist_ok=True)
+    return absolute_dir
+
+
 class MatchService:
     def create(self, data: dict, user_id: int) -> Match:
-        match = Match.objects.create(
-            **data,
-            status=MatchStatus.NOT_STARTED,
-            created_by=user_id,
-            updated_by=user_id,
-        )
+        try:
+            match = Match.objects.create(
+                **data,
+                status=MatchStatus.NOT_STARTED,
+                created_by=user_id,
+                updated_by=user_id,
+            )
+        except IntegrityError as exc:
+            # 外键/唯一约束失败统一映射为参数错误，避免前端只看到 90001
+            raise BusinessException(ResponseCode.PARAM_INVALID, '关联的球队或赛事不存在') from exc
         business_logger.info('match created match_id=%s operator=%s', match.id, user_id)
         return match
 
@@ -46,7 +63,11 @@ class MatchService:
         self._ensure_editable(match)
 
         payload = {k: v for k, v in data.items() if k != 'version'}
-        payload.update({'updated_by': user_id, 'version': version + 1})
+        home_team_id = payload.get('home_team_id', match.home_team_id)
+        away_team_id = payload.get('away_team_id', match.away_team_id)
+        if home_team_id and away_team_id and home_team_id == away_team_id:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '主队与客队不能相同')
+        payload.update({'updated_by': user_id, 'version': version + 1, 'updated_at': timezone.now()})
         with transaction.atomic():
             affected = Match.objects.filter(pk=match.pk, version=version).update(**payload)
             if affected == 0:
@@ -58,7 +79,9 @@ class MatchService:
         if match.status != MatchStatus.NOT_STARTED:
             raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED, '仅未开始的比赛可删除')
         with transaction.atomic():
-            Match.objects.filter(pk=match.pk).update(deleted_at=timezone.now())
+            Match.objects.filter(pk=match.pk).update(
+                deleted_at=timezone.now(), updated_at=timezone.now(),
+            )
         business_logger.info('match deleted match_id=%s operator=%s', match.pk, user_id)
 
     def change_status(self, match: Match, action: str, version: int, user_id: int) -> Match:
@@ -76,7 +99,7 @@ class MatchService:
 
         with transaction.atomic():
             affected = Match.objects.filter(pk=match.pk, version=version).update(
-                status=to_status, version=version + 1, updated_by=user_id
+                status=to_status, version=version + 1, updated_by=user_id, updated_at=timezone.now()
             )
             if affected == 0:
                 raise BusinessException(ResponseCode.OPTIMISTIC_LOCK_CONFLICT)
@@ -94,6 +117,7 @@ class MatchService:
                 lineup_away=lineup_away,
                 version=version + 1,
                 updated_by=user_id,
+                updated_at=timezone.now(),
             )
             if affected == 0:
                 raise BusinessException(ResponseCode.OPTIMISTIC_LOCK_CONFLICT)
@@ -111,15 +135,21 @@ class MatchService:
 
 class MatchEventService:
     def add_event(self, match_id: int, data: dict, user_id: int) -> MatchEvent:
-        with transaction.atomic():
-            match = Match.objects.select_for_update().get(pk=match_id)
-            self._ensure_not_finished(match)
+        try:
+            with transaction.atomic():
+                match = Match.objects.select_for_update().get(pk=match_id)
+                self._ensure_not_finished(match)
 
-            if MatchEvent.objects.filter(client_token=data['client_token']).exists():
-                raise BusinessException(ResponseCode.DUPLICATE_SUBMIT)
+                if MatchEvent.objects.filter(client_token=data['client_token']).exists():
+                    raise BusinessException(ResponseCode.DUPLICATE_SUBMIT)
 
-            event = MatchEvent.objects.create(match=match, created_by=user_id, **data)
-            self._apply_score(match, event.type, event.team_side, 1)
+                try:
+                    event = MatchEvent.objects.create(match=match, created_by=user_id, **data)
+                except IntegrityError as exc:
+                    raise BusinessException(ResponseCode.PARAM_INVALID, '事件关联数据不存在或重复提交') from exc
+                self._apply_score(match, event.type, event.team_side, 1)
+        except Match.DoesNotExist as exc:
+            raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在', status_code=404) from exc
 
         business_logger.info(
             'match event added event_id=%s match_id=%s operator=%s type=%s minute=%s side=%s',
@@ -128,16 +158,26 @@ class MatchEventService:
         return event
 
     def update_event(self, event: MatchEvent, data: dict, user_id: int) -> MatchEvent:
-        with transaction.atomic():
-            match = Match.objects.select_for_update().get(pk=event.match_id)
-            self._ensure_not_finished(match)
+        data.pop('client_token', None)
+        try:
+            with transaction.atomic():
+                match = Match.objects.select_for_update().get(pk=event.match_id)
+                self._ensure_not_finished(match)
 
-            # 先回退旧记分，更新后按新值重算（归属可能变化）
-            self._apply_score(match, event.type, event.team_side, -1)
-            for key, value in data.items():
-                setattr(event, key, value)
-            event.save()
-            self._apply_score(match, event.type, event.team_side, 1)
+                # 按「最终字段值」校验必填规则，避免部分更新把事件改成非法状态
+                self._validate_event_final(event, data)
+
+                # 先回退旧记分，更新后按新值重算（归属可能变化）
+                self._apply_score(match, event.type, event.team_side, -1)
+                for key, value in data.items():
+                    setattr(event, key, value)
+                try:
+                    event.save()
+                except IntegrityError as exc:
+                    raise BusinessException(ResponseCode.PARAM_INVALID, '事件关联数据不存在') from exc
+                self._apply_score(match, event.type, event.team_side, 1)
+        except Match.DoesNotExist as exc:
+            raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在', status_code=404) from exc
 
         business_logger.info(
             'match event updated event_id=%s match_id=%s operator=%s fields=%s',
@@ -146,13 +186,35 @@ class MatchEventService:
         return event
 
     def delete_event(self, event: MatchEvent, user_id: int) -> None:
-        with transaction.atomic():
-            match = Match.objects.select_for_update().get(pk=event.match_id)
-            self._ensure_not_finished(match)
-            self._apply_score(match, event.type, event.team_side, -1)
-            event_id = event.id
-            event.delete()
-        business_logger.info('match event deleted event_id=%s match_id=%s operator=%s', event_id, event.match_id, user_id)
+        match_id = event.match_id
+        try:
+            with transaction.atomic():
+                match = Match.objects.select_for_update().get(pk=match_id)
+                self._ensure_not_finished(match)
+                self._apply_score(match, event.type, event.team_side, -1)
+                event_id = event.id
+                event.delete()
+        except Match.DoesNotExist as exc:
+            raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在', status_code=404) from exc
+        business_logger.info('match event deleted event_id=%s match_id=%s operator=%s', event_id, match_id, user_id)
+
+    @staticmethod
+    def _validate_event_final(event: MatchEvent, data: dict) -> None:
+        event_type = data.get('type', event.type)
+        team_side = data.get('team_side', event.team_side)
+        player_name = data.get('player_name', event.player_name)
+        content = data.get('content', event.content)
+        related_player_name = data.get('related_player_name', event.related_player_name)
+
+        if event_type != EventType.TEXT:
+            if not team_side:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '该事件类型必须指定主客队')
+            if not player_name:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '该事件类型必须指定球员')
+        if event_type == EventType.SUBSTITUTION and not related_player_name:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '换人事件必须指定换上球员')
+        if event_type == EventType.TEXT and not content:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '文字事件必须填写内容')
 
     @staticmethod
     def _apply_score(match: Match, event_type: str, team_side, delta: int) -> None:
@@ -180,9 +242,17 @@ class RefereeService:
         return match.referees.all().order_by('id')
 
     def replace(self, match: Match, referees: list, user_id: int):
+        if match.status == MatchStatus.FINISHED:
+            raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED, '比赛已结束，不可修改裁判')
+
         counts = {}
+        seen = set()
         for item in referees:
             counts[item['role']] = counts.get(item['role'], 0) + 1
+            key = (item['role'], item['name'].strip())
+            if key in seen:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '同一角色下裁判姓名不能重复')
+            seen.add(key)
 
         for role, limit in self.LIMITS.items():
             if counts.get(role, 0) > limit:
@@ -193,9 +263,12 @@ class RefereeService:
 
         with transaction.atomic():
             MatchReferee.objects.filter(match=match).delete()
-            MatchReferee.objects.bulk_create(
-                [MatchReferee(match=match, role=i['role'], name=i['name']) for i in referees]
-            )
+            try:
+                MatchReferee.objects.bulk_create(
+                    [MatchReferee(match=match, role=i['role'], name=i['name']) for i in referees]
+                )
+            except IntegrityError as exc:
+                raise BusinessException(ResponseCode.PARAM_INVALID, '裁判配置重复') from exc
         business_logger.info('match referees replaced match_id=%s operator=%s count=%s', match.pk, user_id, len(referees))
         return match.referees.all().order_by('id')
 
@@ -209,6 +282,9 @@ class MatchFileService:
         return match.files.all().order_by('id')
 
     def upload(self, match: Match, file_type: str, uploaded_file, user_id: int) -> MatchFile:
+        if match.status == MatchStatus.FINISHED:
+            raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED, '比赛已结束，不可上传文件')
+
         name = uploaded_file.name or 'file'
         ext = os.path.splitext(name)[1].lower()
         if ext not in self.ALLOWED_EXT:
@@ -216,26 +292,31 @@ class MatchFileService:
         if uploaded_file.size > settings.MAX_FILE_SIZE:
             raise BusinessException(ResponseCode.FILE_SIZE_EXCEEDED)
 
-        relative_dir = os.path.join('matches', str(match.pk))
-        absolute_dir = os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_dir)
-        os.makedirs(absolute_dir, exist_ok=True)
+        relative_dir = posixpath.join('matches', str(match.pk))
+        ensure_dir(relative_dir)
 
         stored_name = f'{uuid.uuid4().hex}{ext}'
-        relative_path = os.path.join(relative_dir, stored_name)
-        absolute_path = os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_path)
+        relative_path = posixpath.join(relative_dir, stored_name)
+        absolute_path = private_path(relative_path)
         with open(absolute_path, 'wb') as target:
             for chunk in uploaded_file.chunks():
                 target.write(chunk)
 
-        record = MatchFile.objects.create(
-            match=match,
-            type=file_type,
-            file_name=name,
-            file_path=relative_path,
-            mime=uploaded_file.content_type or 'application/octet-stream',
-            size=uploaded_file.size,
-            uploaded_by=user_id,
-        )
+        try:
+            record = MatchFile.objects.create(
+                match=match,
+                type=file_type,
+                file_name=name,
+                file_path=relative_path,
+                mime=uploaded_file.content_type or 'application/octet-stream',
+                size=uploaded_file.size,
+                uploaded_by=user_id,
+            )
+        except Exception:
+            # 数据库写入失败时清理已落盘文件，避免孤儿文件
+            if os.path.exists(absolute_path):
+                os.remove(absolute_path)
+            raise
         business_logger.info(
             'match file uploaded file_id=%s match_id=%s operator=%s type=%s size=%s',
             record.id, match.pk, user_id, file_type, record.size,
@@ -243,14 +324,17 @@ class MatchFileService:
         return record
 
     def absolute_path(self, record: MatchFile) -> str:
-        return os.path.join(settings.PRIVATE_STORAGE_ROOT, record.file_path)
+        return private_path(record.file_path)
 
     def delete(self, record: MatchFile, user_id: int) -> None:
+        if record.match.status == MatchStatus.FINISHED:
+            raise BusinessException(ResponseCode.MATCH_FINISHED_LOCKED, '比赛已结束，不可删除文件')
+        file_id = record.pk
         absolute_path = self.absolute_path(record)
         record.delete()
         if os.path.exists(absolute_path):
             os.remove(absolute_path)
-        business_logger.info('match file deleted file_id=%s operator=%s', record.pk, user_id)
+        business_logger.info('match file deleted file_id=%s operator=%s', file_id, user_id)
 
 
 class FaceVerifyService:
@@ -260,12 +344,15 @@ class FaceVerifyService:
         return match.face_verify_records.all().order_by('-id')
 
     def verify(self, match: Match, player_name: str, player_no, photo, user_id: int) -> FaceVerifyRecord:
-        relative_dir = os.path.join('face_verify', str(match.pk))
-        absolute_dir = os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_dir)
-        os.makedirs(absolute_dir, exist_ok=True)
+        if photo.size > settings.MAX_IMAGE_SIZE:
+            raise BusinessException(ResponseCode.FILE_SIZE_EXCEEDED)
+
+        relative_dir = posixpath.join('face_verify', str(match.pk))
+        ensure_dir(relative_dir)
         stored_name = f'{uuid.uuid4().hex}{os.path.splitext(photo.name or "photo.jpg")[1].lower() or ".jpg"}'
-        relative_path = os.path.join(relative_dir, stored_name)
-        with open(os.path.join(settings.PRIVATE_STORAGE_ROOT, relative_path), 'wb') as target:
+        relative_path = posixpath.join(relative_dir, stored_name)
+        absolute_path = private_path(relative_path)
+        with open(absolute_path, 'wb') as target:
             for chunk in photo.chunks():
                 target.write(chunk)
 
@@ -276,19 +363,26 @@ class FaceVerifyService:
             channel = 'mock'
             request_id = uuid.uuid4().hex
         except Exception as exc:  # pragma: no cover
+            if os.path.exists(absolute_path):
+                os.remove(absolute_path)
             raise BusinessException(ResponseCode.FACE_VERIFY_FAILED) from exc
 
-        record = FaceVerifyRecord.objects.create(
-            match=match,
-            player_name=player_name,
-            player_no=player_no,
-            photo_path=relative_path,
-            result=result,
-            score=score,
-            channel=channel,
-            request_id=request_id,
-            created_by=user_id,
-        )
+        try:
+            record = FaceVerifyRecord.objects.create(
+                match=match,
+                player_name=player_name,
+                player_no=player_no,
+                photo_path=relative_path,
+                result=result,
+                score=score,
+                channel=channel,
+                request_id=request_id,
+                created_by=user_id,
+            )
+        except Exception:
+            if os.path.exists(absolute_path):
+                os.remove(absolute_path)
+            raise
         business_logger.info(
             'face verify done record_id=%s match_id=%s operator=%s result=%s',
             record.id, match.pk, user_id, result,

@@ -3,13 +3,17 @@
 - GET  /api/competitions                          赛事列表（登录即可）
 - GET  /api/registrations                         我的报名单
 - POST /api/registrations                         创建报名单（草稿）
-- GET  /api/registrations/<id>                    报名单详情
+- GET/PUT/DELETE /api/registrations/<id>          报名单详情 / 修改 / 删除
 - POST /api/registrations/<id>/submit             提交报名（驳回后可重新提交）
+- GET  /api/registrations/<id>/form-docx          下载报名表 Word
 - POST /api/registrations/<id>/stamped-form       上传盖章报名表扫描件
 - POST /api/registrations/<id>/athletes/<aid>/enrollment-cert   上传球员学籍验证材料
 - POST /api/registrations/<id>/coach-qualification              上传教练资质附件
 """
+from urllib.parse import quote
+
 from django.db.models import Count
+from django.http import HttpResponse
 from rest_framework import serializers
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -27,6 +31,7 @@ from apps.registration.serializers import (
     RegistrationListSerializer,
 )
 from apps.registration.services import (
+    ExportService,
     MaterialService,
     RegistrationService,
     _get_registration,
@@ -41,6 +46,16 @@ SubmitterOnly = role_permission('coach', 'school')
 class CreateRegistrationSerializer(serializers.Serializer):
     competition_id = serializers.IntegerField(min_value=1)
     team_id = serializers.IntegerField(min_value=1)
+
+
+class UpdateRegistrationSerializer(serializers.Serializer):
+    competition_id = serializers.IntegerField(min_value=1, required=False)
+    team_id = serializers.IntegerField(min_value=1, required=False)
+
+    def validate(self, attrs):
+        if not attrs:
+            raise serializers.ValidationError('至少提供一个待修改字段')
+        return attrs
 
 
 class CompetitionListView(APIView):
@@ -85,6 +100,45 @@ class MyRegistrationDetailView(APIView):
             raise BusinessException(ResponseCode.FORBIDDEN, '仅可查看本校/本队的报名单')
         return Response(RegistrationDetailSerializer(registration).data)
 
+    def put(self, request, pk: int):
+        registration = _get_registration(pk)
+        serializer = UpdateRegistrationSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        registration = RegistrationService().update_draft(
+            request.user,
+            registration,
+            competition_id=serializer.validated_data.get('competition_id'),
+            team_id=serializer.validated_data.get('team_id'),
+        )
+        return Response(RegistrationDetailSerializer(registration).data)
+
+    def delete(self, request, pk: int):
+        registration = _get_registration(pk)
+        RegistrationService().delete_draft(request.user, registration)
+        return Response({'id': pk})
+
+
+class MyRegistrationFormDocxView(APIView):
+    """提交方下载自己报名单的 Word 报名表。"""
+
+    permission_classes = [SubmitterOnly]
+
+    def get(self, request, pk: int):
+        registration = _get_registration(pk)
+        if registration.team_id not in _submitter_team_ids(request.user):
+            raise BusinessException(ResponseCode.FORBIDDEN, '仅可下载本校/本队的报名表')
+        buffer = ExportService().registration_docx(registration)
+        write_log(RegistrationLog.Action.FORM_DOWNLOAD, request.user, registration)
+        response = HttpResponse(
+            buffer.getvalue(),
+            content_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        )
+        filename = quote(f'报名表-{registration.team.name}.docx')
+        response['Content-Disposition'] = (
+            f"attachment; filename=registration_{registration.pk}.docx; filename*=UTF-8''{filename}"
+        )
+        return response
+
 
 class RegistrationSubmitView(APIView):
     permission_classes = [SubmitterOnly]
@@ -125,10 +179,15 @@ class EnrollmentCertUploadView(APIView):
 
         service = MaterialService()
         path, name = service.save(f'athletes/{profile.pk}', uploaded, MaterialService.SCAN_EXTS)
-        service.remove_quietly(profile.enrollment_cert_path)
+        old_path = profile.enrollment_cert_path
         profile.enrollment_cert_path = path
         profile.enrollment_cert_name = name
-        profile.save(update_fields=['enrollment_cert_path', 'enrollment_cert_name', 'updated_at'])
+        try:
+            profile.save(update_fields=['enrollment_cert_path', 'enrollment_cert_name', 'updated_at'])
+        except Exception:
+            service.remove_quietly(path)
+            raise
+        service.remove_quietly(old_path)
         write_log(RegistrationLog.Action.MATERIAL_UPLOAD, request.user, registration,
                   {'material': 'enrollment_cert', 'athlete_id': profile.pk, 'name': name})
         return Response(RegistrationDetailSerializer(registration).data)
@@ -154,10 +213,15 @@ class CoachQualificationUploadView(APIView):
 
         service = MaterialService()
         path, name = service.save(f'coaches/{profile.pk}', uploaded, MaterialService.SCAN_EXTS)
-        service.remove_quietly(profile.qualification_path)
+        old_path = profile.qualification_path
         profile.qualification_path = path
         profile.qualification_name = name
-        profile.save(update_fields=['qualification_path', 'qualification_name', 'updated_at'])
+        try:
+            profile.save(update_fields=['qualification_path', 'qualification_name', 'updated_at'])
+        except Exception:
+            service.remove_quietly(path)
+            raise
+        service.remove_quietly(old_path)
         write_log(RegistrationLog.Action.MATERIAL_UPLOAD, request.user, registration,
                   {'material': 'coach_qualification', 'coach_id': profile.pk, 'name': name})
         return Response(RegistrationDetailSerializer(registration).data)

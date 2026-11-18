@@ -143,7 +143,7 @@ class CoachProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='coach_profile')
     name = models.CharField('姓名', max_length=50)
     phone = models.CharField('联系电话', max_length=20, null=True, blank=True)
-    id_card = models.CharField('身份证号', max_length=18, null=True, blank=True)
+    id_card = models.CharField('身份证号', max_length=18, null=True, blank=True, unique=True)
     qualification_path = models.CharField('资质附件路径', max_length=255, null=True, blank=True)
     qualification_name = models.CharField('资质附件文件名', max_length=255, null=True, blank=True)
     status = models.CharField('审核状态', max_length=20, choices=ProfileStatus.choices, default=ProfileStatus.PENDING, db_index=True)
@@ -155,6 +155,12 @@ class CoachProfile(models.Model):
         db_table = 'coach_profiles'
         indexes = [models.Index(fields=['status'])]
 
+    def save(self, *args, **kwargs):
+        # 空身份证统一存 NULL，避免唯一索引把空串当成重复值
+        if not self.id_card:
+            self.id_card = None
+        super().save(*args, **kwargs)
+
 
 class AthleteProfile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='athlete_profile')
@@ -162,7 +168,7 @@ class AthleteProfile(models.Model):
     name = models.CharField('姓名', max_length=50)
     jersey_no = models.PositiveSmallIntegerField('球衣号码', null=True, blank=True)
     position = models.CharField('位置', max_length=20, null=True, blank=True)
-    id_card = models.CharField('身份证号', max_length=18, null=True, blank=True)
+    id_card = models.CharField('身份证号', max_length=18, null=True, blank=True, unique=True)
     avatar_path = models.CharField('头像路径', max_length=255, null=True, blank=True)
     avatar_name = models.CharField('头像文件名', max_length=255, null=True, blank=True)
     enrollment_cert_path = models.CharField('学籍验证材料路径', max_length=255, null=True, blank=True)
@@ -175,6 +181,16 @@ class AthleteProfile(models.Model):
     class Meta:
         db_table = 'athlete_profiles'
         indexes = [models.Index(fields=['team', 'status'])]
+        constraints = [
+            # 同一球队内球衣号唯一；NULL 在 SQLite/MySQL 唯一索引中互不冲突
+            models.UniqueConstraint(fields=['team', 'jersey_no'], name='uniq_athlete_team_jersey'),
+        ]
+
+    def save(self, *args, **kwargs):
+        # 空身份证统一存 NULL，避免唯一索引把空串当成重复值
+        if not self.id_card:
+            self.id_card = None
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return self.name

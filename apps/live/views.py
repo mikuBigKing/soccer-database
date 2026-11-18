@@ -4,6 +4,7 @@ import os
 from django.db.models import Q
 from django.http import FileResponse
 from django.shortcuts import get_object_or_404
+from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -43,7 +44,7 @@ from .services import (
 
 
 def _get_match(pk: int) -> Match:
-    match = Match.objects.filter(pk=pk).first()
+    match = Match.objects.select_related('competition', 'home_team', 'away_team').filter(pk=pk).first()
     if match is None:
         raise BusinessException(ResponseCode.NOT_FOUND, '比赛不存在', status_code=404)
     return match
@@ -64,11 +65,11 @@ def _school_id_of(user) -> int | None:
 def _school_match_queryset(user):
     """返回「主队或客队属于本校」的比赛查询集；管理员/省级返回全量，校级未绑定返回空。"""
     if is_admin(user) or getattr(user, 'role', None) == UserRole.PROVINCE:
-        return Match.objects.all()
+        return Match.objects.select_related('competition').all()
     school_id = _school_id_of(user)
     if school_id is None:
         return Match.objects.none()
-    return Match.objects.filter(
+    return Match.objects.select_related('competition').filter(
         Q(home_team__school_id=school_id) | Q(away_team__school_id=school_id)
     )
 
@@ -146,14 +147,21 @@ def _event_action_result(match_id: int, event) -> dict:
 # ---------------------------------------------------------------------------
 
 class PublicMatchListView(APIView):
+    # 公众端免登；显式清空认证，避免浏览器残留过期 token 时被 401 拦截
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def get(self, request):
-        queryset = Match.objects.all()
+        queryset = Match.objects.select_related('competition').all()
         status_value = request.query_params.get('status')
         if status_value:
             queryset = queryset.filter(status=status_value)
         group_type = request.query_params.get('group_type')
         if group_type:
             queryset = queryset.filter(group_type=group_type)
+        competition_id = request.query_params.get('competition_id')
+        if competition_id:
+            queryset = queryset.filter(competition_id=competition_id)
 
         data = paginate(queryset, request)
         data['list'] = MatchListSerializer(data['list'], many=True).data
@@ -161,6 +169,9 @@ class PublicMatchListView(APIView):
 
 
 class PublicMatchDetailView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def get(self, request, pk: int):
         match = _get_match(pk)
         payload = MatchDetailSerializer(match).data
@@ -170,6 +181,9 @@ class PublicMatchDetailView(APIView):
 
 
 class PublicMatchEventListView(APIView):
+    authentication_classes = []
+    permission_classes = [AllowAny]
+
     def get(self, request, pk: int):
         match = _get_match(pk)
         queryset = match.events.all()
@@ -199,6 +213,9 @@ class AdminMatchListCreateView(APIView):
         group_type = request.query_params.get('group_type')
         if group_type:
             queryset = queryset.filter(group_type=group_type)
+        competition_id = request.query_params.get('competition_id')
+        if competition_id:
+            queryset = queryset.filter(competition_id=competition_id)
         keyword = request.query_params.get('keyword')
         if keyword:
             queryset = queryset.filter(

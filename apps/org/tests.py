@@ -14,6 +14,102 @@ def access_token(user):
     return str(RefreshToken.for_user(user).access_token)
 
 
+class TeamManagementTest(TestCase):
+    """参赛管理：球队筛选 / 详情 / 成员 / 比赛记录 / 重置教练密码。"""
+
+    def setUp(self):
+        from django.utils import timezone
+
+        from apps.live.models import Match
+
+        self.client = APIClient()
+        province = Province.objects.create(name='联赛省', code='940000')
+        self.city1 = City.objects.create(province=province, name='联赛甲市', code='940100')
+        self.city2 = City.objects.create(province=province, name='联赛乙市', code='940200')
+        school1 = School.objects.create(city=self.city1, name='联赛甲校')
+        school2 = School.objects.create(city=self.city2, name='联赛乙校')
+
+        self.admin = User.objects.create_user(
+            username='team-admin@test.com', email='team-admin@test.com', name='管理员',
+            role=UserRole.ADMIN, password='pass1234',
+        )
+        self.city_user = User.objects.create_user(
+            username='13930000001', phone='13930000001', name='甲市管理员',
+            role=UserRole.CITY, password='pass1234',
+        )
+        CityProfile.objects.create(user=self.city_user, name='甲市管理员', city=self.city1)
+
+        self.coach = User.objects.create_user(
+            username='13930000002', phone='13930000002', name='教练甲',
+            role=UserRole.COACH, password='pass1234',
+        )
+        CoachProfile.objects.create(user=self.coach, name='教练甲', status='approved')
+
+        self.team1 = Team.objects.create(
+            school=school1, coach=self.coach, name='甲队',
+            group_type=GroupType.MIDDLE_SCHOOL, status=TeamStatus.APPROVED,
+        )
+        self.team2 = Team.objects.create(
+            school=school2, coach=self.coach, name='乙队',
+            group_type=GroupType.MIDDLE_SCHOOL, status=TeamStatus.APPROVED,
+        )
+        athlete_user = User.objects.create_user(
+            username='13930000003', phone='13930000003', name='球员甲',
+            role=UserRole.ATHLETE, password='pass1234',
+        )
+        AthleteProfile.objects.create(
+            user=athlete_user, team=self.team1, name='球员甲', jersey_no=8, status='approved',
+        )
+        Match.objects.create(
+            group_type=GroupType.MIDDLE_SCHOOL, home_team=self.team1, away_team=self.team2,
+            home_team_name='甲队', away_team_name='乙队', match_time=timezone.now(),
+            status='finished', home_score=2, away_score=1,
+        )
+
+    def auth(self, user):
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token(user)}')
+
+    def test_filter_by_city_and_group(self):
+        self.auth(self.admin)
+        data = self.client.get('/api/admin/teams', {'city_id': self.city1.id}).json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['list'][0]['name'], '甲队')
+
+        data = self.client.get('/api/admin/teams', {'group_type': GroupType.MIDDLE_SCHOOL}).json()['data']
+        self.assertEqual(data['total'], 2)
+
+    def test_city_user_only_sees_own_city(self):
+        self.auth(self.city_user)
+        data = self.client.get('/api/admin/teams').json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['list'][0]['name'], '甲队')
+
+    def test_detail_members_and_matches(self):
+        self.auth(self.admin)
+        detail = self.client.get(f'/api/admin/teams/{self.team1.id}').json()['data']
+        self.assertEqual(detail['athlete_count'], 1)
+        self.assertEqual(detail['coach']['name'], '教练甲')
+        self.assertEqual(detail['school']['city_name'], '联赛甲市')
+
+        members = self.client.get(f'/api/admin/teams/{self.team1.id}/athletes').json()['data']
+        self.assertEqual(members['total'], 1)
+        self.assertEqual(members['list'][0]['jersey_no'], 8)
+
+        matches = self.client.get(f'/api/admin/teams/{self.team1.id}/matches').json()['data']
+        self.assertEqual(matches['total'], 1)
+        self.assertEqual(matches['list'][0]['result'], 'win')
+
+    def test_reset_coach_password(self):
+        from django.contrib.auth.hashers import check_password
+
+        self.auth(self.admin)
+        resp = self.client.post(f'/api/admin/teams/{self.team1.id}/reset-coach-password', {}, format='json')
+        password = resp.json()['data']['password']
+        self.coach.refresh_from_db()
+        self.assertTrue(check_password(password, self.coach.password))
+
+
+
 class OrgPermissionTest(TestCase):
     def setUp(self):
         self.client = APIClient()

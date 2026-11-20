@@ -7,7 +7,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("live", "0001_initial"),
+        ("live", "0002_match_clock_minute_match_score_source_match_stage_and_more"),
         ("org", "0005_alter_city_province_alter_school_city_and_more"),
         (
             "registration",

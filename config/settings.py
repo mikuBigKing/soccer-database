@@ -74,6 +74,7 @@ INSTALLED_APPS = [
     'apps.athlete',
     'apps.registration',
     'apps.admin_console',
+    'apps.selection',
     'apps.report',
     'apps.eventops',
 ]
@@ -99,6 +100,7 @@ MIDDLEWARE += [
     # trace_id + 访问日志（对应 Laravel 的 TraceIdMiddleware / ApiLogMiddleware）
     'apps.common.middleware.TraceIDMiddleware',
     'apps.common.middleware.ApiLogMiddleware',
+    'apps.common.audit.AuditLogMiddleware',
 ]
 
 ROOT_URLCONF = 'config.urls'

@@ -78,6 +78,18 @@ def _log(request, action: str, target_type: str, target_id: int, before=None, af
         ip=_client_ip(request),
         trace_id=(getattr(request, 'trace_id', '') or '')[:64],
     )
+    # 同步写全局审计（admin_operation_logs 保留给既有查询/导出）
+    from apps.common.audit import write_audit
+
+    write_audit(
+        request,
+        module={'player': 'player', 'coach': 'coach'}.get(target_type, 'admin'),
+        action=action,
+        resource_type=target_type,
+        resource_id=target_id,
+        before=before,
+        after=after,
+    )
 
 
 def _sync_user_phone(user, new_phone: str) -> bool:
@@ -273,7 +285,7 @@ def list_players(request, params: dict) -> dict:
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
     if params.get('id_card'):
-        qs = qs.filter(id_card__iexact=params['id_card'])
+        qs = qs.filter(id_card__iendswith=params['id_card'])
     if 'jersey_no' in params:
         qs = qs.filter(jersey_no=params['jersey_no'])
     if 'team_id' in params:
@@ -621,7 +633,7 @@ def list_coaches(request, params: dict) -> dict:
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
     if params.get('id_card'):
-        qs = qs.filter(id_card__iexact=params['id_card'])
+        qs = qs.filter(id_card__iendswith=params['id_card'])
     if 'team_id' in params:
         qs = qs.filter(user__coached_teams__id=params['team_id'])
     if params.get('group_type'):
@@ -1443,7 +1455,7 @@ def _player_export_queryset(request, params):
     if params.get('name'):
         qs = qs.filter(name__icontains=params['name'])
     if params.get('id_card'):
-        qs = qs.filter(id_card__iexact=params['id_card'])
+        qs = qs.filter(id_card__iendswith=params['id_card'])
     if params.get('keyword'):
         kw = params['keyword']
         qs = qs.filter(Q(name__icontains=kw) | Q(id_card__icontains=kw))

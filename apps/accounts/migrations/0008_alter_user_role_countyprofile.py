@@ -8,7 +8,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("accounts", "0003_athleteprofile_avatar_name_and_more"),
+        ("accounts", "0007_user_scope_city_user_scope_province_and_more"),
         ("org", "0003_school_county"),
     ]
 

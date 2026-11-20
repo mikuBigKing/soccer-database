@@ -240,20 +240,208 @@ class SchoolDetailView(APIView):
 
 
 class TeamListView(APIView):
-    """球队列表：管理员全量，校级仅本校。"""
+    """球队列表：管理员全量，校级仅本校；支持市州/区县/组别/赛事/状态筛选。"""
 
-    permission_classes = [role_permission('admin', 'school')]
+    permission_classes = [role_permission('admin', 'city', 'school')]
 
     def get(self, request):
-        queryset = Team.objects.all()
-        status_value = request.query_params.get('status')
-        if status_value:
-            queryset = queryset.filter(status=status_value)
+        queryset = (Team.objects.select_related('school__city', 'coach')
+                    .order_by('-id'))
+        params = request.query_params
+        if params.get('city_id'):
+            queryset = queryset.filter(school__city_id=params['city_id'])
+        if params.get('county'):
+            queryset = queryset.filter(school__county=params['county'])
+        if params.get('school_id'):
+            queryset = queryset.filter(school_id=params['school_id'])
+        if params.get('group_type'):
+            queryset = queryset.filter(group_type=params['group_type'])
+        if params.get('status'):
+            queryset = queryset.filter(status=params['status'])
+        if params.get('competition_id'):
+            queryset = queryset.filter(registrations__competition_id=params['competition_id']).distinct()
+        keyword = (params.get('keyword') or '').strip()
+        if keyword:
+            from django.db.models import Q
+
+            queryset = queryset.filter(Q(name__icontains=keyword) | Q(school__name__icontains=keyword))
+
         user = request.user
         if user.role == 'school':
             profile = user.role_profile()
             queryset = queryset.filter(school_id=profile.school_id) if profile and profile.school_id else queryset.none()
+        elif user.role == 'city':
+            profile = user.role_profile()
+            queryset = queryset.filter(school__city_id=profile.city_id) if profile and profile.city_id else queryset.none()
         return Response(_paginated(Team, request, TeamSerializer, queryset))
+
+
+class TeamDetailView(APIView):
+    """球队详情：基础信息 + 学校/教练 + 报名记录 + 最近比赛。"""
+
+    permission_classes = [role_permission('admin', 'city', 'school')]
+
+    def get(self, request, pk: int):
+        team = _scoped_team(request, pk)
+        return Response(_team_detail(team))
+
+
+class TeamAthletesView(APIView):
+    """球队成员（球员档案）。"""
+
+    permission_classes = [role_permission('admin', 'city', 'school')]
+
+    def get(self, request, pk: int):
+        from apps.accounts.models import AthleteProfile
+
+        team = _scoped_team(request, pk)
+        rows = (AthleteProfile.objects.filter(team=team, deleted_at__isnull=True)
+                .select_related('school').order_by('jersey_no', 'id'))
+        return Response({'total': len(rows), 'list': [{
+            'id': row.id,
+            'name': row.name,
+            'jersey_no': row.jersey_no,
+            'position': row.position,
+            'status': row.status,
+            'status_label': row.get_status_display(),
+            'eligibility_status': row.eligibility_status,
+            'phone': row.user.phone,
+            'is_public': row.is_public,
+        } for row in rows]})
+
+
+class TeamCoachesView(APIView):
+    """球队教练（当前为球队绑定教练一人）。"""
+
+    permission_classes = [role_permission('admin', 'city', 'school')]
+
+    def get(self, request, pk: int):
+        from apps.accounts.models import CoachProfile
+
+        team = _scoped_team(request, pk)
+        coach = team.coach
+        profile = CoachProfile.objects.filter(user=coach).first()
+        return Response({'total': 1 if coach else 0, 'list': [{
+            'id': coach.id if coach else None,
+            'name': coach.name if coach else None,
+            'phone': coach.phone if coach else None,
+            'status': coach.status if coach else None,
+            'profile_status': profile.status if profile else None,
+            'profile_status_label': profile.get_status_display() if profile else None,
+            'is_public': profile.is_public if profile else None,
+        }]})
+
+
+class TeamMatchesView(APIView):
+    """球队比赛记录（比分 + 结果）。"""
+
+    permission_classes = [role_permission('admin', 'city', 'school')]
+
+    def get(self, request, pk: int):
+        from django.db.models import Q
+
+        from apps.live.models import Match
+
+        team = _scoped_team(request, pk)
+        matches = (Match.objects.filter(Q(home_team=team) | Q(away_team=team))
+                   .select_related('competition', 'home_team', 'away_team')
+                   .order_by('-match_time'))
+        rows = []
+        for match in matches[:100]:
+            is_home = match.home_team_id == team.id
+            my = match.home_score if is_home else match.away_score
+            opp = match.away_score if is_home else match.home_score
+            result = 'win' if my > opp else ('draw' if my == opp else 'loss')
+            rows.append({
+                'id': match.id,
+                'competition_id': match.competition_id,
+                'competition_name': match.competition.name if match.competition_id else None,
+                'match_time': match.match_time.strftime('%Y-%m-%d %H:%M:%S') if match.match_time else None,
+                'home_team': match.home_team.name if match.home_team_id else None,
+                'away_team': match.away_team.name if match.away_team_id else None,
+                'home_score': match.home_score,
+                'away_score': match.away_score,
+                'stage': match.stage,
+                'status': match.status,
+                'result': result,
+            })
+        return Response({'total': len(rows), 'list': rows})
+
+
+class TeamResetCoachPasswordView(APIView):
+    """重置球队教练账号密码，返回本次生效的密码（默认密码或自定义）。"""
+
+    permission_classes = [role_permission('admin', 'city', 'school')]
+
+    def post(self, request, pk: int):
+        from django.conf import settings
+
+        team = _scoped_team(request, pk)
+        if team.coach_id is None:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '球队未绑定教练')
+        password = (request.data.get('password') or '').strip() or settings.DEFAULT_RESET_PASSWORD
+        team.coach.set_password(password)
+        team.coach.save(update_fields=['password'])
+        from apps.common.audit import write_audit
+
+        write_audit(request, module='team', action='重置球队教练密码',
+                    resource_type='team', resource_id=team.id)
+        return Response({'id': team.id, 'coach_id': team.coach_id, 'password': password})
+
+
+def _scoped_team(request, pk: int) -> Team:
+    team = Team.objects.select_related('school__city', 'coach').filter(pk=pk).first()
+    if team is None:
+        raise BusinessException(ResponseCode.NOT_FOUND, '球队不存在', status_code=404)
+    user = request.user
+    if is_admin(user):
+        return team
+    profile = user.role_profile()
+    if user.role == 'school' and (not profile or profile.school_id != team.school_id):
+        raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本校球队')
+    if user.role == 'city' and (not profile or not profile.city_id
+                                or profile.city_id != team.school.city_id):
+        raise BusinessException(ResponseCode.FORBIDDEN, '仅可操作本市球队')
+    return team
+
+
+def _team_detail(team: Team) -> dict:
+    from apps.accounts.models import AthleteProfile
+
+    registrations = (team.registrations.select_related('competition')
+                     .order_by('-created_at'))
+    return {
+        'id': team.id,
+        'name': team.name,
+        'logo': team.logo,
+        'group_type': team.group_type,
+        'group_type_label': team.get_group_type_display(),
+        'status': team.status,
+        'status_label': team.get_status_display(),
+        'reject_reason': team.reject_reason,
+        'created_at': team.created_at.strftime('%Y-%m-%d %H:%M:%S'),
+        'school': {
+            'id': team.school_id,
+            'name': team.school.name,
+            'county': team.school.county,
+            'city_id': team.school.city_id,
+            'city_name': team.school.city.name if team.school.city_id else None,
+        },
+        'coach': {
+            'id': team.coach_id,
+            'name': team.coach.name,
+            'phone': team.coach.phone,
+            'status': team.coach.status,
+        } if team.coach_id else None,
+        'athlete_count': AthleteProfile.objects.filter(team=team, deleted_at__isnull=True).count(),
+        'registrations': [{
+            'id': reg.id,
+            'competition_id': reg.competition_id,
+            'competition_name': reg.competition.name if reg.competition_id else None,
+            'status': reg.status,
+            'created_at': reg.created_at.strftime('%Y-%m-%d %H:%M:%S') if reg.created_at else None,
+        } for reg in registrations],
+    }
 
 
 def _get(model, pk: int, label: str):

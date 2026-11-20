@@ -1607,11 +1607,11 @@ class MergePlayerTest(BaseAdminData):
             AdminOperationLog.objects.filter(action='合并球员', target_id=self.p1.id).exists(),
         )
 
-    def test_merge_same_id_card_allowed(self):
-        duplicate = self._create_duplicate(name='李雷')
-        AthleteProfile.objects.filter(pk=duplicate.pk).update(id_card=ID_CARD_1)
+    def test_merge_same_name_allowed(self):
+        # 证件号库级唯一后，合并入口以同名重叠触发（历史同证号重复数据由存量库处理）
+        duplicate = self._create_duplicate(name=self.p1.name)
         resp = self.admin_client.post('/api/admin/players/merge', {
-            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '身份证重复',
+            'primary_id': self.p1.id, 'duplicate_id': duplicate.id, 'reason': '同名重复',
         }, format='json')
         self.assertEqual(resp.json()['code'], 0)
 
@@ -2507,4 +2507,183 @@ class ScopeExtraCoverageTest(BaseAdminData):
         first = body[0]
         self.assertIn('****', first[8])  # phone_masked 脱敏
         self.assertIn('****', first[9])  # id_card_masked 脱敏
+
+
+class UserAccountAdminTest(BaseAdminData):
+    """管理员账号总表 /api/admin/users。"""
+
+    def test_only_admin_can_access(self):
+        self.assertGreaterEqual(self.outsider_client.get('/api/admin/users').status_code, 403)
+
+    def test_create_city_account_update_reset_and_disable(self):
+        city = City.objects.first()
+        resp = self.admin_client.post('/api/admin/users', {
+            'role': 'city', 'name': '市管理员', 'phone': '13600000001', 'city_id': city.id,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+        uid = resp.json()['data']['id']
+
+        user = User.objects.get(pk=uid)
+        self.assertEqual(user.role, 'city')
+        self.assertEqual(user.scope_city_id, city.id)
+        self.assertTrue(check_password(settings.DEFAULT_RESET_PASSWORD, user.password))
+
+        resp = self.admin_client.put(f'/api/admin/users/{uid}', {'name': '市管理员甲'}, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertEqual(resp.json()['data']['name'], '市管理员甲')
+
+        resp = self.admin_client.post(f'/api/admin/users/{uid}/reset-password', {}, format='json')
+        self.assertEqual(resp.json()['data']['password'], settings.DEFAULT_RESET_PASSWORD)
+
+        resp = self.admin_client.delete(f'/api/admin/users/{uid}')
+        self.assertEqual(resp.json()['code'], 0)
+        user.refresh_from_db()
+        self.assertEqual(user.status, UserStatus.DISABLED)
+        self.assertFalse(user.is_active)
+
+    def test_list_filters_by_role_and_keyword(self):
+        data = self.admin_client.get('/api/admin/users', {'role': 'admin'}).json()['data']
+        self.assertGreaterEqual(data['total'], 1)
+        self.assertTrue(all(row['role'] == 'admin' for row in data['list']))
+
+        data = self.admin_client.get('/api/admin/users', {'keyword': '张三'}).json()['data']
+        self.assertGreaterEqual(data['total'], 1)
+
+    def test_duplicate_phone_rejected(self):
+        resp = self.admin_client.post('/api/admin/users', {
+            'role': 'personal', 'name': '重复号', 'phone': '13800000001',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_admin_requires_email(self):
+        resp = self.admin_client.post('/api/admin/users', {'role': 'admin', 'name': '管理员二号'},
+                                      format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_cannot_disable_self(self):
+        resp = self.admin_client.delete(f'/api/admin/users/{self.admin.id}')
+        self.assertEqual(resp.json()['code'], 10001)
+
+
+class IdCardAndJerseyRuleTest(BaseAdminData):
+    """身份证唯一（软删不占用）+ 后四位检索 + 同队球衣唯一、跨队可重复。"""
+
+    def test_player_lookup_by_id_card_suffix(self):
+        suffix = ID_CARD_1[-4:]
+        data = self.admin_client.get('/api/admin/players', {'id_card': suffix}).json()['data']
+        self.assertEqual(data['total'], 1)
+        self.assertEqual(data['list'][0]['id'], self.p1.id)
+
+    def test_coach_lookup_by_id_card_suffix(self):
+        suffix = ID_CARD_1[-4:]
+        data = self.admin_client.get('/api/admin/coaches', {'id_card': suffix}).json()['data']
+        self.assertEqual(data['total'], 1)
+
+    def test_duplicate_jersey_in_same_team_rejected_by_db(self):
+        from django.db import IntegrityError, transaction
+
+        user = User.objects.create_user(
+            username='13960000001', phone='13960000001', name='撞号球员',
+            role='athlete', password='pass1234',
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AthleteProfile.objects.create(
+                    user=user, team=self.team, name='撞号球员', jersey_no=10,
+                )
+
+    def test_same_jersey_in_other_team_allowed(self):
+        other_team = Team.objects.create(
+            school=self.school, coach=self.coach2_user, name='测试二队',
+            group_type=GroupType.MIDDLE_SCHOOL,
+        )
+        user = User.objects.create_user(
+            username='13960000002', phone='13960000002', name='跨队同号',
+            role='athlete', password='pass1234',
+        )
+        profile = AthleteProfile.objects.create(
+            user=user, team=other_team, name='跨队同号', jersey_no=10,
+        )
+        self.assertEqual(profile.jersey_no, 10)
+
+    def test_duplicate_active_id_card_rejected(self):
+        resp = self.admin_client.post('/api/admin/players', {
+            'name': '重复证件', 'phone': '13700008883', 'id_card': ID_CARD_1,
+            'team_id': self.team.id, 'jersey_no': 12,
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_id_card_unique_in_db_but_soft_deleted_free(self):
+        from django.db import IntegrityError, transaction
+        from django.utils import timezone
+
+        user = User.objects.create_user(
+            username='13960000003', phone='13960000003', name='证件占用',
+            role='athlete', password='pass1234',
+        )
+        AthleteProfile.objects.create(
+            user=user, name='证件占用', id_card=NEW_ID_CARD_3,
+        )
+        other = User.objects.create_user(
+            username='13960000004', phone='13960000004', name='证件冲突',
+            role='athlete', password='pass1234',
+        )
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                AthleteProfile.objects.create(
+                    user=other, name='证件冲突', id_card=NEW_ID_CARD_3,
+                )
+
+        # 软删后不再占用证件号
+        AthleteProfile.objects.filter(user=user).update(deleted_at=timezone.now())
+        reused = AthleteProfile.objects.create(
+            user=other, name='证件冲突', id_card=NEW_ID_CARD_3,
+        )
+        self.assertEqual(reused.id_card, NEW_ID_CARD_3)
+
+
+class AuditLogTest(BaseAdminData):
+    """全局审计：业务写审计 + 中间件兜底 + 查询/导出。"""
+
+    def test_business_action_writes_audit(self):
+        from apps.admin_console.models import AuditLog
+
+        resp = self.admin_client.post('/api/admin/users', {
+            'role': 'personal', 'name': '审计用户', 'phone': '13700009991',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0)
+        self.assertTrue(AuditLog.objects.filter(module='admin', action='创建账号',
+                                                resource_type='user').exists())
+
+        data = self.admin_client.get('/api/admin/audit-logs', {'module': 'admin'}).json()['data']
+        self.assertGreaterEqual(data['total'], 1)
+        self.assertEqual(data['list'][0]['module'], 'admin')
+
+    def test_export_returns_csv(self):
+        self.admin_client.post('/api/admin/users', {
+            'role': 'personal', 'name': '导出用户', 'phone': '13700009992',
+        }, format='json')
+        resp = self.admin_client.get('/api/admin/audit-logs/export')
+        self.assertIn('text/csv', resp['Content-Type'])
+        body = b''.join(resp.streaming_content).decode('utf-8-sig')
+        self.assertIn('发生时间', body)
+        self.assertIn('创建账号', body)
+
+    def test_middleware_fallback_without_business_log(self):
+        from django.http import HttpResponse
+        from django.test import RequestFactory
+
+        from apps.admin_console.models import AuditLog
+        from apps.common.audit import AuditLogMiddleware
+
+        request = RequestFactory().post('/api/admin/teams/1/reset-coach-password')
+        request.user = self.admin
+        request.trace_id = 'trace-fallback'
+        middleware = AuditLogMiddleware(lambda req: HttpResponse(status=200))
+        middleware(request)
+
+        row = AuditLog.objects.filter(trace_id='trace-fallback').first()
+        self.assertIsNotNone(row)
+        self.assertEqual(row.resource_type, 'http')
+        self.assertEqual(row.module, 'admin')
 

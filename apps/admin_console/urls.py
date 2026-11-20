@@ -1,6 +1,13 @@
 """管理端球员 / 教练员路由（挂在 /api/admin/ 下，不带结尾斜杠）。"""
 from django.urls import path
 
+from .account_admin import (
+    UserBatchResetPasswordView,
+    UserDetailView,
+    UserListView,
+    UserResetPasswordView,
+)
+from .audit_views import AuditLogExportView, AuditLogListView
 from .views import (
     CoachAccountStatusView,
     CoachBatchResetPasswordView,
@@ -36,6 +43,14 @@ from .views import (
 )
 
 urlpatterns = [
+    path('users', UserListView.as_view()),
+    path('users/batch-reset-password', UserBatchResetPasswordView.as_view()),
+    path('users/<int:pk>', UserDetailView.as_view()),
+    path('users/<int:pk>/reset-password', UserResetPasswordView.as_view()),
+
+    path('audit-logs', AuditLogListView.as_view()),
+    path('audit-logs/export', AuditLogExportView.as_view()),
+
     path('players', PlayerListView.as_view()),
     path('players/merge', PlayerMergeView.as_view()),
     path('players/batch-reset-password', PlayerBatchResetPasswordView.as_view()),

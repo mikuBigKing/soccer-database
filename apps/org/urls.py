@@ -8,7 +8,12 @@ from .views import (
     ProvinceListCreateView,
     SchoolDetailView,
     SchoolListCreateView,
+    TeamAthletesView,
+    TeamCoachesView,
+    TeamDetailView,
     TeamListView,
+    TeamMatchesView,
+    TeamResetCoachPasswordView,
 )
 
 urlpatterns = [
@@ -19,4 +24,9 @@ urlpatterns = [
     path('schools', SchoolListCreateView.as_view()),
     path('schools/<int:pk>', SchoolDetailView.as_view()),
     path('teams', TeamListView.as_view()),
+    path('teams/<int:pk>', TeamDetailView.as_view()),
+    path('teams/<int:pk>/athletes', TeamAthletesView.as_view()),
+    path('teams/<int:pk>/coaches', TeamCoachesView.as_view()),
+    path('teams/<int:pk>/matches', TeamMatchesView.as_view()),
+    path('teams/<int:pk>/reset-coach-password', TeamResetCoachPasswordView.as_view()),
 ]

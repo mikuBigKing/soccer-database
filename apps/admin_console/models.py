@@ -102,3 +102,31 @@ class PlayerTeamChange(models.Model):
         db_table = 'player_team_changes'
         ordering = ('-id',)
         indexes = [models.Index(fields=['player', 'created_at'])]
+
+
+class AuditLog(models.Model):
+    """全局操作审计：业务层显式记录，中间件兜底记录写操作。"""
+
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True,
+        on_delete=models.SET_NULL, related_name='+', verbose_name='操作人',
+    )
+    actor_role = models.CharField('操作人角色', max_length=20, blank=True, default='')
+    module = models.CharField('模块', max_length=32, blank=True, default='', db_index=True)
+    action = models.CharField('动作', max_length=64, db_index=True)
+    resource_type = models.CharField('对象类型', max_length=32, blank=True, default='')
+    resource_id = models.BigIntegerField('对象 ID', null=True, blank=True)
+    before = models.JSONField('变更前', null=True, blank=True)
+    after = models.JSONField('变更后', null=True, blank=True)
+    ip = models.CharField('来源 IP', max_length=64, blank=True, default='')
+    trace_id = models.CharField('链路 ID', max_length=64, blank=True, default='', db_index=True)
+    created_at = models.DateTimeField('发生时间', auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'audit_logs'
+        ordering = ('-id',)
+        indexes = [
+            models.Index(fields=['module', 'action', 'created_at']),
+            models.Index(fields=['actor', 'created_at']),
+            models.Index(fields=['resource_type', 'resource_id']),
+        ]

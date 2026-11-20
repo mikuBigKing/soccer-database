@@ -32,11 +32,19 @@ class ResponseCode(IntEnum):
 
     # 400xx 业务规则
     OPTIMISTIC_LOCK_CONFLICT = 9
+    BUSINESS_ERROR = 40001
     MATCH_FINISHED_LOCKED = 40002
+    SEQ_OUT_OF_ORDER = 40004
     DUPLICATE_SUBMIT = 40009
+    # 赛事运营后台
+    EVENT_MATCH_CONSISTENCY = 40010  # 事件进球与赛果比分不一致，需显式确认
+    MATCH_NOT_STARTED = 40011        # 比赛未开始，禁止事件录入
+    MATCH_EVENTED_LOCKED = 40012     # 赛事数据已归档，禁止修改
+    REF_IN_USE = 40013               # 裁判已被比赛引用，不可删除
 
     # 500xx 外部服务
     FACE_VERIFY_FAILED = 50008
+    AI_SERVICE_FAILED = 50009
 
     # 600xx 存储
     DB_ERROR = 60001
@@ -56,9 +64,16 @@ MESSAGES = {
     ResponseCode.FORBIDDEN: '无操作权限',
     ResponseCode.NOT_FOUND: '资源不存在',
     ResponseCode.OPTIMISTIC_LOCK_CONFLICT: '数据已被他人修改，请刷新后重试',
+    ResponseCode.BUSINESS_ERROR: '业务处理失败',
     ResponseCode.MATCH_FINISHED_LOCKED: '比赛已结束，禁止修改',
+    ResponseCode.SEQ_OUT_OF_ORDER: '报文序号乱序，已忽略',
     ResponseCode.DUPLICATE_SUBMIT: '请勿重复提交',
+    ResponseCode.EVENT_MATCH_CONSISTENCY: '事件进球汇总与赛果比分不一致，请确认后重新提交',
+    ResponseCode.MATCH_NOT_STARTED: '比赛未开始，禁止录入事件',
+    ResponseCode.MATCH_EVENTED_LOCKED: '赛事数据已归档，禁止修改',
+    ResponseCode.REF_IN_USE: '裁判已被比赛引用，不可删除',
     ResponseCode.FACE_VERIFY_FAILED: '人脸核验服务异常',
+    ResponseCode.AI_SERVICE_FAILED: 'AI 报告生成服务异常，请稍后重试',
     ResponseCode.DB_ERROR: '数据存储异常',
     ResponseCode.SYSTEM_ERROR: '系统繁忙，请稍后重试',
 }

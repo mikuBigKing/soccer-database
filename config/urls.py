@@ -4,6 +4,7 @@
 - /api/public/live/*     赛事直播公众端（免登）
 - /api/admin/live/*      赛事直播管理端（登录 + 权限点）
 - /api/school/live/*     赛事直播校级端（role=school，按本校数据域裁剪）
+- /api/*/matches/*/report 赛事报告（公众端免登 / 管理端 admin+province）
 - /api/admin/*           行政区划/城市/学校（管理员）
 - /api/city/*            市级查阅
 - /api/athlete/*         运动员端
@@ -25,12 +26,17 @@ urlpatterns = [
     path('api/school/', include('apps.registration.urls_school')),
     path('api/school/', include('apps.org.urls_school')),
     path('api/coach/', include('apps.org.urls_coach')),
+    path('api/device/', include('apps.live.urls_device')),
+    path('api/public/live/', include('apps.report.urls_public')),
+    path('api/admin/live/', include('apps.report.urls_admin')),
     path('api/admin/', include('apps.org.urls')),
+    path('api/admin/', include('apps.admin_console.urls')),
     path('api/', include('apps.org.urls_city')),
     path('api/athlete/', include('apps.athlete.urls')),
     path('api/', include('apps.registration.urls')),
     path('api/city/', include('apps.registration.urls_city')),
     path('api/province/', include('apps.registration.urls_province')),
+    path('api/ops/', include('apps.eventops.urls')),
 ]
 
 if settings.DEBUG:

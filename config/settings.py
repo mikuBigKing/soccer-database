@@ -73,6 +73,9 @@ INSTALLED_APPS = [
     'apps.live',
     'apps.athlete',
     'apps.registration',
+    'apps.admin_console',
+    'apps.report',
+    'apps.eventops',
 ]
 
 # 前后端分域部署时启用 CORS（同源反向代理部署可不配置）。
@@ -169,6 +172,19 @@ PRIVATE_STORAGE_ROOT = BASE_DIR / 'storage' / 'private'
 MAX_IMAGE_SIZE = int(os.getenv('MAX_IMAGE_SIZE', str(10 * 1024 * 1024)))
 MAX_FILE_SIZE = int(os.getenv('MAX_FILE_SIZE', str(10 * 1024 * 1024)))
 
+# 管理员重置球员/教练登录密码后的默认密码（任何日志/响应都不落明文）
+DEFAULT_RESET_PASSWORD = os.getenv('DEFAULT_RESET_PASSWORD', 'Abc@123456')
+
+# 管理员自定义重置密码时的密码策略（字母 + 数字，8–64 位）
+PASSWORD_POLICY = os.getenv('PASSWORD_POLICY', r'^(?=.*[A-Za-z])(?=.*\d).{8,64}$')
+
+# 停赛规则（红黄牌累计自动停赛）
+SUSPENSION_RULES = {
+    'yellow_threshold': 4,        # 累计 4 张黄牌
+    'yellow_ban_matches': 1,      # 停赛 1 场
+    'red_ban_matches': 2,         # 红牌停 2 场
+}
+
 DATA_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024
 
@@ -226,3 +242,18 @@ LOGGING = {
         'api': {'handlers': ['console'], 'level': 'INFO', 'propagate': False},
     },
 }
+
+# ---------------------------------------------------------------------------
+# 赛事报告 AI（Qwen3 / OpenAI 兼容端点）
+# ---------------------------------------------------------------------------
+REPORT_ENABLED = os.getenv('REPORT_ENABLED', '1') == '1'
+REPORT_LLM_BASE_URL = os.getenv('REPORT_LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+REPORT_LLM_API_KEY = os.getenv('REPORT_LLM_API_KEY', '')
+REPORT_LLM_MODEL = os.getenv('REPORT_LLM_MODEL', 'qwen3-max')
+REPORT_LLM_TIMEOUT = int(os.getenv('REPORT_LLM_TIMEOUT', '60'))
+REPORT_LLM_TEMPERATURE = float(os.getenv('REPORT_LLM_TEMPERATURE', '0.3'))
+REPORT_LLM_MAX_TOKENS = int(os.getenv('REPORT_LLM_MAX_TOKENS', '2000'))
+# Qwen3 思考模式会产生大量 reasoning token（实测同一场报告 338s / 3688 tokens），生产默认关闭
+REPORT_LLM_DISABLE_THINKING = os.getenv('REPORT_LLM_DISABLE_THINKING', '1') == '1'
+# 未配置 API Key 时自动走 mock，保证本地与 CI 可用
+REPORT_LLM_MOCK = os.getenv('REPORT_LLM_MOCK', '1' if not REPORT_LLM_API_KEY else '0') == '1'

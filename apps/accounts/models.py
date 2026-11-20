@@ -31,6 +31,23 @@ class ProfileStatus(models.TextChoices):
     REJECTED = 'rejected', '已驳回'
 
 
+class VerifyStatus(models.TextChoices):
+    UNVERIFIED = 'unverified', '未验证'
+    VERIFIED = 'verified', '已验证'
+    FAILED = 'failed', '验证不通过'
+
+
+class Gender(models.TextChoices):
+    MALE = 'male', '男'
+    FEMALE = 'female', '女'
+
+
+class EligibilityStatus(models.TextChoices):
+    ELIGIBLE = 'eligible', '可参赛'
+    SUSPENDED = 'suspended', '停赛中'
+    DISQUALIFIED = 'disqualified', '取消资格'
+
+
 class User(AbstractUser):
     """主账号表。
 
@@ -44,6 +61,20 @@ class User(AbstractUser):
     role = models.CharField('角色', max_length=20, choices=UserRole.choices, default=UserRole.PERSONAL, db_index=True)
     status = models.CharField('账号状态', max_length=20, choices=UserStatus.choices, default=UserStatus.ACTIVE, db_index=True)
     permissions = models.JSONField('权限点', default=list, blank=True)
+
+    # 数据权限范围（阶段三）
+    scope_school = models.ForeignKey(
+        'org.School', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖学校',
+    )
+    scope_city = models.ForeignKey(
+        'org.City', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖城市',
+    )
+    scope_province = models.ForeignKey(
+        'org.Province', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+', verbose_name='管辖省份',
+    )
 
     class Meta:
         db_table = 'users'
@@ -150,6 +181,11 @@ class CoachProfile(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_public = models.BooleanField('是否公示', default=False, db_index=True)
+    deleted_at = models.DateTimeField('软删除时间', null=True, blank=True)
+    public_start_at = models.DateTimeField('公示开始', null=True, blank=True)
+    public_end_at = models.DateTimeField('公示结束', null=True, blank=True)
+    unpublish_reason = models.CharField('取消公示原因', max_length=200, null=True, blank=True)
 
     class Meta:
         db_table = 'coach_profiles'
@@ -177,6 +213,29 @@ class AthleteProfile(models.Model):
     reject_reason = models.TextField('驳回原因', null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
+    is_public = models.BooleanField('是否公示', default=False, db_index=True)
+    deleted_at = models.DateTimeField('软删除时间', null=True, blank=True)
+    school = models.ForeignKey(
+        'org.School', null=True, blank=True, on_delete=models.SET_NULL, related_name='athletes_direct',
+    )
+    gender = models.CharField(
+        '性别', max_length=10, choices=Gender.choices, null=True, blank=True,
+    )
+    grade = models.CharField('年级', max_length=20, null=True, blank=True)
+    height_cm = models.PositiveSmallIntegerField('身高(cm)', null=True, blank=True)
+    weight_kg = models.PositiveSmallIntegerField('体重(kg)', null=True, blank=True)
+    real_name_status = models.CharField(
+        '实名认证', max_length=20, choices=VerifyStatus.choices,
+        default=VerifyStatus.UNVERIFIED, db_index=True,
+    )
+    enrollment_status = models.CharField(
+        '学籍验证', max_length=20, choices=VerifyStatus.choices,
+        default=VerifyStatus.UNVERIFIED, db_index=True,
+    )
+    eligibility_status = models.CharField(
+        '参赛资格', max_length=20, choices=EligibilityStatus.choices,
+        default=EligibilityStatus.ELIGIBLE, db_index=True,
+    )
 
     class Meta:
         db_table = 'athlete_profiles'

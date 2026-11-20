@@ -41,6 +41,26 @@ def env_list(name: str, default: str = '') -> list[str]:
 DEBUG = env_bool('DJANGO_DEBUG', False)
 _RUNNING_LOCAL_COMMAND = bool({Path(arg).name for arg in sys.argv[:2]} & _LOCAL_COMMANDS)
 
+# ---------------------------------------------------------------------------
+# 邮件 / 邮箱验证码
+# 开发默认 console 后端（验证码打印到控制台），生产在 .env 配置 SMTP 即可
+# ---------------------------------------------------------------------------
+EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+EMAIL_HOST = os.getenv('EMAIL_HOST', '')
+EMAIL_PORT = int(os.getenv('EMAIL_PORT', '465'))
+EMAIL_USE_SSL = env_bool('EMAIL_USE_SSL', True)
+EMAIL_USE_TLS = env_bool('EMAIL_USE_TLS', False)
+EMAIL_HOST_USER = os.getenv('EMAIL_HOST_USER', '')
+EMAIL_HOST_PASSWORD = os.getenv('EMAIL_HOST_PASSWORD', '')
+EMAIL_TIMEOUT = int(os.getenv('EMAIL_TIMEOUT', '10'))
+DEFAULT_FROM_EMAIL = os.getenv('DEFAULT_FROM_EMAIL', '赛事系统 <no-reply@localhost>')
+
+VERIFICATION_CODE_TTL_SECONDS = int(os.getenv('VERIFICATION_CODE_TTL_SECONDS', '600'))
+VERIFICATION_CODE_COOLDOWN_SECONDS = int(os.getenv('VERIFICATION_CODE_COOLDOWN_SECONDS', '60'))
+VERIFICATION_CODE_HOURLY_LIMIT = int(os.getenv('VERIFICATION_CODE_HOURLY_LIMIT', '5'))
+VERIFICATION_CODE_DAILY_LIMIT = int(os.getenv('VERIFICATION_CODE_DAILY_LIMIT', '10'))
+VERIFICATION_CODE_MAX_ATTEMPTS = int(os.getenv('VERIFICATION_CODE_MAX_ATTEMPTS', '5'))
+
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', '').strip()
 if not SECRET_KEY:
     if DEBUG or _RUNNING_LOCAL_COMMAND:

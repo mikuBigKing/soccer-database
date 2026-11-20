@@ -36,6 +36,7 @@ from rest_framework.views import APIView
 
 from apps.accounts.validators import ensure_id_card_unique
 from apps.accounts.models import AthleteProfile, CityProfile, CoachProfile, CountyProfile, ProfileStatus, ProvinceProfile, SchoolProfile, UserRole
+from apps.accounts.utils import placeholder_email
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException, delete_or_block
 from apps.common.pagination import paginated_response
@@ -659,7 +660,8 @@ class ProvinceAccountListCreateView(APIView):
                 )
             else:
                 user = User.objects.create_user(
-                    username=data['phone'], phone=data['phone'], name=data['name'],
+                    username=placeholder_email(data['phone']), email=placeholder_email(data['phone']),
+                    phone=data['phone'], name=data['name'],
                     role=data['role'], password=data['password'],
                 )
             if data['role'] == UserRole.CITY:

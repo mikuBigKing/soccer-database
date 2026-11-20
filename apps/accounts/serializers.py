@@ -60,26 +60,38 @@ class UserSerializer(serializers.ModelSerializer):
 
 
 class RegisterSerializer(serializers.Serializer):
-    """个人 / 运动员 / 教练自助注册。"""
+    """个人 / 运动员 / 教练自助注册：邮箱 + 邮箱验证码。"""
 
     name = serializers.CharField(max_length=50)
-    phone = serializers.RegexField(r'^1[3-9]\d{9}$', error_messages={'invalid': '手机号格式不正确'})
+    email = serializers.EmailField(max_length=191)
     password = serializers.CharField(min_length=6, max_length=64, write_only=True)
     role = serializers.ChoiceField(choices=[UserRole.PERSONAL, UserRole.COACH, UserRole.ATHLETE])
+    code = serializers.CharField(max_length=6, write_only=True)
 
-    def validate_phone(self, value):
-        if User.objects.filter(phone=value).exists():
-            raise serializers.ValidationError('该手机号已被注册')
+    def validate_email(self, value):
+        value = value.strip().lower()
+        if User.objects.filter(email__iexact=value).exists():
+            raise serializers.ValidationError('该邮箱已被注册')
         return value
+
+    def validate(self, attrs):
+        from .models import VerificationCode
+        from .verification import normalize_email, verify_code
+
+        request = self.context.get('request')
+        verify_code(request, normalize_email(attrs['email']),
+                    VerificationCode.Scene.REGISTER, attrs['code'])
+        return attrs
 
     def create(self, validated_data):
         from django.db import transaction
 
         role = validated_data['role']
+        email = validated_data['email']
         with transaction.atomic():
             user = User.objects.create_user(
-                username=validated_data['phone'],
-                phone=validated_data['phone'],
+                username=email,
+                email=email,
                 name=validated_data['name'],
                 role=role,
                 password=validated_data['password'],
@@ -88,7 +100,6 @@ class RegisterSerializer(serializers.Serializer):
                 CoachProfile.objects.create(
                     user=user,
                     name=validated_data['name'],
-                    phone=validated_data['phone'],
                     status=ProfileStatus.PENDING,
                 )
             elif role == UserRole.ATHLETE:
@@ -101,10 +112,45 @@ class RegisterSerializer(serializers.Serializer):
 
 
 class LoginSerializer(serializers.Serializer):
-    """非管理员统一登录：手机号 + 密码。"""
+    """统一登录：邮箱 + 密码。"""
 
-    phone = serializers.CharField(max_length=20)
+    email = serializers.EmailField(max_length=191)
     password = serializers.CharField(max_length=64, write_only=True)
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
+class EmailSendSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=191)
+    scene = serializers.ChoiceField(choices=['register', 'reset_password', 'change_password', 'change_email'])
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
+class PasswordResetSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=191)
+    code = serializers.CharField(max_length=6, write_only=True)
+    new_password = serializers.CharField(min_length=6, max_length=64, write_only=True)
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+
+class EmailChangeSerializer(serializers.Serializer):
+    email = serializers.EmailField(max_length=191)
+    code = serializers.CharField(max_length=6, write_only=True)
+
+    def validate_email(self, value):
+        return value.strip().lower()
+
+    def validate(self, attrs):
+        from .models import User as _User
+
+        if _User.objects.filter(email__iexact=attrs['email']).exists():
+            raise serializers.ValidationError({'email': '该邮箱已被其他账号使用'})
+        return attrs
 
 
 class AdminLoginSerializer(serializers.Serializer):

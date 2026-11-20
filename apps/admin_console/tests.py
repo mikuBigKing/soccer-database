@@ -32,8 +32,10 @@ PASSWORD = 'Passw0rd!'
 
 
 def make_user(username, role, phone=None, email=None, password=PASSWORD, name=''):
+    # 登录已统一为邮箱：未显式给邮箱时用 username 派生，保证测试账号可登录
     return User.objects.create_user(
-        username=username, role=role, phone=phone, email=email, password=password, name=name,
+        username=username, role=role, phone=phone, email=email or f'{username}@test.local',
+        password=password, name=name,
     )
 
 
@@ -611,7 +613,10 @@ class MaskingTest(TestCase):
 # ---------------------------------------------------------------------------
 
 def login(client, phone, password=PASSWORD):
-    return client.post('/api/auth/login', {'phone': phone, 'password': password}, format='json')
+    """登录已改为邮箱标识：按手机号找到账号后，用其邮箱登录。"""
+    user = User.objects.filter(phone=phone).first()
+    email = user.email if user else phone
+    return client.post('/api/auth/login', {'email': email, 'password': password}, format='json')
 
 
 class UserPhoneSyncTest(BaseAdminData):
@@ -626,11 +631,15 @@ class UserPhoneSyncTest(BaseAdminData):
         self.coach2_user.refresh_from_db()
         self.assertEqual(self.c2.phone, new_phone)
         self.assertEqual(self.coach2_user.phone, new_phone)
-        self.assertEqual(self.coach2_user.username, new_phone)
+        # 登录标识是邮箱，手机号变更不再改写 username
+        self.assertEqual(self.coach2_user.username, 'coach2')
 
         client = APIClient()
-        self.assertEqual(login(client, '13700000002').json()['code'], 20002)
-        self.assertEqual(login(client, new_phone).json()['code'], 0)
+        # 手机号不再是登录标识：旧号登录无效，改用邮箱登录
+        self.assertNotEqual(login(client, '13700000002').json()['code'], 0)
+        resp = client.post('/api/auth/login',
+                           {'email': self.coach2_user.email, 'password': PASSWORD}, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
 
     def test_coach_phone_conflict_rejected(self):
         resp = self.admin_client.put(
@@ -649,14 +658,14 @@ class UserPhoneSyncTest(BaseAdminData):
 
         self.p2_user.refresh_from_db()
         self.assertEqual(self.p2_user.phone, new_phone)
-        self.assertEqual(self.p2_user.username, new_phone)
+        self.assertEqual(self.p2_user.username, 'athlete2')
 
-        # 旧号已让出，重新注册不应撞 username 唯一约束（不能 500）
-        resp = APIClient().post('/api/auth/register', {
-            'name': '新人', 'phone': old_phone, 'password': PASSWORD, 'role': 'personal',
-        }, format='json')
-        self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()['code'], 0)
+        # 旧号已让出，可再次被占用（不撞唯一约束）
+        reused = User.objects.create_user(
+            username='reuse@test.local', email='reuse@test.local',
+            phone=old_phone, role='personal', password=PASSWORD,
+        )
+        self.assertEqual(reused.phone, old_phone)
 
     def test_player_phone_conflict_rejected(self):
         resp = self.admin_client.put(
@@ -850,7 +859,7 @@ class PlayerCreateTest(BaseAdminData):
 
         user = User.objects.get(phone='13600000011')
         self.assertEqual(user.role, 'athlete')
-        self.assertEqual(user.username, '13600000011')
+        self.assertEqual(user.username, '13600000011@placeholder.local')
         self.assertTrue(check_password(settings.DEFAULT_RESET_PASSWORD, user.password))
         # 默认密码可登录
         self.assertEqual(
@@ -2518,7 +2527,8 @@ class UserAccountAdminTest(BaseAdminData):
     def test_create_city_account_update_reset_and_disable(self):
         city = City.objects.first()
         resp = self.admin_client.post('/api/admin/users', {
-            'role': 'city', 'name': '市管理员', 'phone': '13600000001', 'city_id': city.id,
+            'role': 'city', 'name': '市管理员', 'phone': '13600000001',
+            'email': 'city-admin@test.com', 'city_id': city.id,
         }, format='json')
         self.assertEqual(resp.json()['code'], 0, resp.json())
         uid = resp.json()['data']['id']
@@ -2549,11 +2559,12 @@ class UserAccountAdminTest(BaseAdminData):
         data = self.admin_client.get('/api/admin/users', {'keyword': '张三'}).json()['data']
         self.assertGreaterEqual(data['total'], 1)
 
-    def test_duplicate_phone_rejected(self):
+    def test_duplicate_email_rejected(self):
         resp = self.admin_client.post('/api/admin/users', {
-            'role': 'personal', 'name': '重复号', 'phone': '13800000001',
+            'role': 'personal', 'name': '重复邮箱', 'email': 'athlete1@test.local',
         }, format='json')
         self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('邮箱', resp.json()['msg'])
 
     def test_admin_requires_email(self):
         resp = self.admin_client.post('/api/admin/users', {'role': 'admin', 'name': '管理员二号'},
@@ -2649,7 +2660,8 @@ class AuditLogTest(BaseAdminData):
         from apps.admin_console.models import AuditLog
 
         resp = self.admin_client.post('/api/admin/users', {
-            'role': 'personal', 'name': '审计用户', 'phone': '13700009991',
+            'role': 'personal', 'name': '审计用户', 'email': 'audit-user1@test.local',
+            'phone': '13700009991',
         }, format='json')
         self.assertEqual(resp.json()['code'], 0)
         self.assertTrue(AuditLog.objects.filter(module='admin', action='创建账号',
@@ -2661,7 +2673,8 @@ class AuditLogTest(BaseAdminData):
 
     def test_export_returns_csv(self):
         self.admin_client.post('/api/admin/users', {
-            'role': 'personal', 'name': '导出用户', 'phone': '13700009992',
+            'role': 'personal', 'name': '导出用户', 'email': 'audit-user2@test.local',
+            'phone': '13700009992',
         }, format='json')
         resp = self.admin_client.get('/api/admin/audit-logs/export')
         self.assertIn('text/csv', resp['Content-Type'])

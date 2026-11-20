@@ -78,23 +78,20 @@ class UserQuerySerializer(serializers.Serializer):
 class UserCreateSerializer(serializers.Serializer):
     role = serializers.ChoiceField(choices=UserRole.choices)
     name = serializers.CharField(max_length=50)
+    email = serializers.EmailField(max_length=191)
     phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
-    email = serializers.EmailField(required=False, allow_blank=True)
     password = serializers.CharField(required=False, allow_blank=True, write_only=True)
     province_id = serializers.IntegerField(required=False, allow_null=True)
     city_id = serializers.IntegerField(required=False, allow_null=True)
     school_id = serializers.IntegerField(required=False, allow_null=True)
     county = serializers.CharField(max_length=50, required=False, allow_blank=True)
 
+    def validate_email(self, value):
+        return value.strip().lower()
+
     def validate(self, attrs):
         role = attrs['role']
-        if role == UserRole.ADMIN:
-            if not attrs.get('email'):
-                raise serializers.ValidationError({'email': '管理员必须填写邮箱'})
-        elif role in PHONE_ROLES and not attrs.get('phone'):
-            raise serializers.ValidationError({'phone': '该角色必须填写手机号'})
-        if role in (UserRole.PROVINCE, UserRole.CITY, UserRole.COUNTY) and not attrs.get('city_id') \
-                and role != UserRole.PROVINCE:
+        if role in (UserRole.CITY, UserRole.COUNTY) and not attrs.get('city_id'):
             raise serializers.ValidationError({'city_id': '必须选择所属城市'})
         if role == UserRole.PROVINCE and not attrs.get('province_id'):
             raise serializers.ValidationError({'province_id': '必须选择所属省份'})
@@ -207,18 +204,18 @@ def create_user(request, data: dict) -> dict:
     role = data['role']
     password = data.get('password') or settings.DEFAULT_RESET_PASSWORD
     name = data['name']
+    email = data['email'].strip().lower()
+    phone = (data.get('phone') or '').strip() or None
 
+    _ensure_email_available(email)
+    if phone:
+        _ensure_phone_available(phone)
+
+    user = User.objects.create_user(username=email, email=email, phone=phone,
+                                    name=name, role=role, password=password)
     if role == UserRole.ADMIN:
-        email = data['email'].strip().lower()
-        _ensure_email_available(email)
-        user = User.objects.create_user(username=email, email=email, name=name,
-                                        role=role, password=password)
         AdminProfile.objects.create(user=user, name=name)
     else:
-        phone = data['phone'].strip()
-        _ensure_phone_available(phone)
-        user = User.objects.create_user(username=phone, phone=phone, name=name,
-                                        role=role, password=password)
         _create_profile(user, name, role, data)
 
     if data.get('province_id') or data.get('city_id') or data.get('school_id'):
@@ -318,8 +315,7 @@ def update_user(request, pk: int, data: dict) -> dict:
         phone = data['phone'].strip()
         _ensure_phone_available(phone, exclude_pk=user.pk)
         user.phone = phone
-        user.username = phone
-        updates.extend(['phone', 'username'])
+        updates.append('phone')
         if user.role == UserRole.COACH:
             profile = user.role_profile()
             if profile is not None:
@@ -330,9 +326,8 @@ def update_user(request, pk: int, data: dict) -> dict:
         email = (data['email'] or '').strip().lower() or None
         if email:
             _ensure_email_available(email, exclude_pk=user.pk)
-            if user.role == UserRole.ADMIN:
-                user.username = email
-                updates.append('username')
+            user.username = email
+            updates.append('username')
         user.email = email
         updates.append('email')
 

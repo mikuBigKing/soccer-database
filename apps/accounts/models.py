@@ -52,12 +52,13 @@ class EligibilityStatus(models.TextChoices):
 class User(AbstractUser):
     """主账号表。
 
-    username 作为登录唯一标识：管理员取 email，其余角色取 phone，
+    username 作为登录唯一标识：统一取 email，
     仅用于满足 AbstractUser 的唯一约束，不对外暴露。
     """
 
     name = models.CharField('姓名', max_length=50, blank=True, default='')
     email = models.EmailField('邮箱', max_length=191, unique=True, null=True, blank=True)
+    email_verified_at = models.DateTimeField('邮箱验证时间', null=True, blank=True)
     phone = models.CharField('手机号', max_length=20, unique=True, null=True, blank=True)
     role = models.CharField('角色', max_length=20, choices=UserRole.choices, default=UserRole.PERSONAL, db_index=True)
     status = models.CharField('账号状态', max_length=20, choices=UserStatus.choices, default=UserStatus.ACTIVE, db_index=True)
@@ -272,3 +273,28 @@ class AthleteProfile(models.Model):
 
     def __str__(self):
         return self.name
+
+
+class VerificationCode(models.Model):
+    """邮箱验证码（登录/注册/改密/换绑共用）。"""
+
+    class Scene(models.TextChoices):
+        REGISTER = 'register', '注册'
+        RESET_PASSWORD = 'reset_password', '忘记密码'
+        CHANGE_PASSWORD = 'change_password', '修改密码'
+        CHANGE_EMAIL = 'change_email', '绑定/换绑邮箱'
+
+    email = models.CharField('邮箱', max_length=191, db_index=True)
+    scene = models.CharField('场景', max_length=32, choices=Scene.choices, db_index=True)
+    code_hash = models.CharField('验证码哈希', max_length=128)
+    expires_at = models.DateTimeField('过期时间')
+    used_at = models.DateTimeField('使用时间', null=True, blank=True)
+    attempts = models.PositiveSmallIntegerField('校验失败次数', default=0)
+    ip = models.CharField('来源 IP', max_length=64, blank=True, default='')
+    trace_id = models.CharField('链路 ID', max_length=64, blank=True, default='')
+    created_at = models.DateTimeField('发送时间', auto_now_add=True, db_index=True)
+
+    class Meta:
+        db_table = 'verification_codes'
+        ordering = ('-id',)
+        indexes = [models.Index(fields=['email', 'scene', 'created_at'])]

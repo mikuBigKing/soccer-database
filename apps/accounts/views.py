@@ -10,15 +10,30 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 
-from .models import UserRole, UserStatus
+from .models import UserRole, UserStatus, VerificationCode
 from .serializers import (
     AdminLoginSerializer,
+    EmailChangeSerializer,
+    EmailSendSerializer,
     LoginSerializer,
+    PasswordResetSerializer,
     RegisterSerializer,
     UserSerializer,
 )
+from .verification import issue_code, verify_code
 
 User = get_user_model()
+
+PLACEHOLDER_DOMAIN = '@placeholder.local'
+
+
+def _require_real_email(user) -> str:
+    email = (user.email or '').strip().lower()
+    if not email or email.endswith(PLACEHOLDER_DOMAIN):
+        raise BusinessException(
+            ResponseCode.PARAM_INVALID, '当前账号未绑定可用邮箱，请联系管理员补录邮箱'
+        )
+    return email
 
 
 def _issue_tokens(user) -> dict:
@@ -37,14 +52,14 @@ class RegisterView(APIView):
     permission_classes = []
 
     def post(self, request):
-        serializer = RegisterSerializer(data=request.data)
+        serializer = RegisterSerializer(data=request.data, context={'request': request})
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
         return Response(_issue_tokens(user))
 
 
 class LoginView(APIView):
-    """非管理员统一登录（phone + password）。"""
+    """统一登录（email + password）。"""
 
     authentication_classes = []
     permission_classes = []
@@ -52,10 +67,10 @@ class LoginView(APIView):
     def post(self, request):
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        phone = serializer.validated_data['phone']
+        email = serializer.validated_data['email']
         password = serializer.validated_data['password']
 
-        user = User.objects.filter(phone=phone).first()
+        user = User.objects.filter(email__iexact=email).first()
         if user is None or not user.check_password(password):
             raise BusinessException(ResponseCode.CREDENTIALS_INVALID)
         if user.role == UserRole.ADMIN:
@@ -64,6 +79,19 @@ class LoginView(APIView):
             raise BusinessException(ResponseCode.ACCOUNT_DISABLED)
 
         return Response(_issue_tokens(user))
+
+
+class EmailSendView(APIView):
+    """发送邮箱验证码（注册 / 找回密码 / 修改密码 / 换绑邮箱）。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        serializer = EmailSendSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        return Response(issue_code(request, data['email'], data['scene']))
 
 
 class AdminLoginView(APIView):
@@ -143,6 +171,7 @@ class RefreshTokenView(APIView):
 class ChangePasswordSerializer(serializers.Serializer):
     old_password = serializers.CharField(max_length=64, write_only=True)
     new_password = serializers.CharField(min_length=6, max_length=64, write_only=True)
+    code = serializers.CharField(max_length=6, write_only=True)
 
     def validate_new_password(self, value):
         if value == self.initial_data.get('old_password'):
@@ -151,7 +180,7 @@ class ChangePasswordSerializer(serializers.Serializer):
 
 
 class ChangePasswordView(APIView):
-    """登录用户修改自己的密码。"""
+    """登录用户修改自己的密码：旧密码 + 邮箱验证码。"""
 
     permission_classes = [IsAuthenticated]
 
@@ -161,9 +190,53 @@ class ChangePasswordView(APIView):
         user = request.user
         if not user.check_password(serializer.validated_data['old_password']):
             raise BusinessException(ResponseCode.CREDENTIALS_INVALID, '原密码不正确')
+        email = _require_real_email(user)
+        verify_code(request, email, VerificationCode.Scene.CHANGE_PASSWORD,
+                    serializer.validated_data['code'])
         user.set_password(serializer.validated_data['new_password'])
         user.save(update_fields=['password'])
         return Response({'changed': True})
+
+
+class PasswordResetView(APIView):
+    """忘记密码：邮箱 + 验证码 + 新密码。"""
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        serializer = PasswordResetSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        user = User.objects.filter(email__iexact=data['email']).first()
+        if user is None:
+            raise BusinessException(ResponseCode.PARAM_INVALID, '该邮箱未注册')
+        if not user.is_active or user.status == UserStatus.DISABLED:
+            raise BusinessException(ResponseCode.ACCOUNT_DISABLED)
+        verify_code(request, data['email'], VerificationCode.Scene.RESET_PASSWORD, data['code'])
+        user.set_password(data['new_password'])
+        user.save(update_fields=['password'])
+        return Response({'reset': True})
+
+
+class EmailChangeView(APIView):
+    """登录用户绑定 / 换绑邮箱：新邮箱 + 验证码。"""
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        serializer = EmailChangeSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        verify_code(request, data['email'], VerificationCode.Scene.CHANGE_EMAIL, data['code'])
+        user = request.user
+        user.email = data['email']
+        user.username = data['email']
+        from django.utils import timezone as _tz
+
+        user.email_verified_at = _tz.now()
+        user.save(update_fields=['email', 'username', 'email_verified_at'])
+        return Response({'email': user.email, 'verified': True})
 
 
 class MeView(APIView):

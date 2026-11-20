@@ -44,14 +44,25 @@ class FullRegistrationLoopTest(TestCase):
         client.credentials(HTTP_AUTHORIZATION=f'Bearer {RefreshToken.for_user(user).access_token}')
         return client
 
+    def _send_register_code(self, client, email):
+        from unittest.mock import patch
+
+        with patch('apps.accounts.verification._generate_code', return_value='123456'):
+            resp = client.post('/api/auth/email/send',
+                               {'email': email, 'scene': 'register'}, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+        return '123456'
+
     def test_new_user_full_loop(self):
         # 1. 教练自助注册（profile 待审核、无身份证）
         coach_client = APIClient()
+        coach_code = self._send_register_code(coach_client, 'coach-loop@test.com')
         resp = coach_client.post('/api/auth/register', {
-            'name': '闭环教练', 'phone': '13950000002', 'password': 'pass1234', 'role': 'coach',
+            'name': '闭环教练', 'email': 'coach-loop@test.com', 'code': coach_code,
+            'password': 'pass1234', 'role': 'coach',
         }, format='json')
         self.assertEqual(resp.json()['code'], 0)
-        coach = CoachProfile.objects.get(user__phone='13950000002')
+        coach = CoachProfile.objects.get(user__email='coach-loop@test.com')
         coach_client = self._client_for(coach.user)
 
         # 2. 教练补身份证，校级审核通过
@@ -78,11 +89,13 @@ class FullRegistrationLoopTest(TestCase):
 
         # 4. 球员自助注册、补身份证、校级审核通过
         athlete_client = APIClient()
+        athlete_code = self._send_register_code(athlete_client, 'athlete-loop@test.com')
         resp = athlete_client.post('/api/auth/register', {
-            'name': '闭环球员', 'phone': '13950000003', 'password': 'pass1234', 'role': 'athlete',
+            'name': '闭环球员', 'email': 'athlete-loop@test.com', 'code': athlete_code,
+            'password': 'pass1234', 'role': 'athlete',
         }, format='json')
         self.assertEqual(resp.json()['code'], 0)
-        athlete = AthleteProfile.objects.get(user__phone='13950000003')
+        athlete = AthleteProfile.objects.get(user__email='athlete-loop@test.com')
         athlete_client = self._client_for(athlete.user)
         self.assertEqual(
             athlete_client.put('/api/athlete/profile', {'id_card': '510100200009099012'}, format='json').json()['code'],

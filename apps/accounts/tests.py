@@ -24,23 +24,33 @@ class AuthSecurityTest(TestCase):
             role=UserRole.ADMIN, password='pass1234',
         )
         self.province_user = User.objects.create_user(
-            username='13900000001', phone='13900000001', name='省级',
+            username='province@test.com', email='province@test.com', phone='13900000001', name='省级',
             role=UserRole.PROVINCE, password='pass1234',
         )
         ProvinceProfile.objects.create(user=self.province_user, name='省级', province=self.province)
         self.city_user = User.objects.create_user(
-            username='13900000002', phone='13900000002', name='市级',
+            username='city@test.com', email='city@test.com', phone='13900000002', name='市级',
             role=UserRole.CITY, password='pass1234',
         )
         CityProfile.objects.create(user=self.city_user, name='市级', city=self.city)
         self.athlete_user = User.objects.create_user(
-            username='13900000003', phone='13900000003', name='球员',
+            username='athlete@test.com', email='athlete@test.com', phone='13900000003', name='球员',
             role=UserRole.ATHLETE, password='pass1234',
         )
         AthleteProfile.objects.create(user=self.athlete_user, name='球员', status='approved')
 
     def auth(self, user):
         self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token(user)}')
+
+    def send_code(self, email, scene):
+        """固定验证码为 123456，避免依赖邮件内容。"""
+        from unittest.mock import patch
+
+        with patch('apps.accounts.verification._generate_code', return_value='123456'):
+            resp = self.client.post('/api/auth/email/send',
+                                    {'email': email, 'scene': scene}, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+        return '123456'
 
     def test_disabled_account_token_is_rejected(self):
         self.auth(self.athlete_user)
@@ -88,17 +98,18 @@ class AuthSecurityTest(TestCase):
 
     def test_change_password(self):
         self.auth(self.athlete_user)
+        code = self.send_code('athlete@test.com', 'change_password')
         resp = self.client.post(
             '/api/auth/password',
-            {'old_password': 'pass1234', 'new_password': 'newpass99'},
+            {'old_password': 'pass1234', 'new_password': 'newpass99', 'code': code},
             format='json',
         )
         self.assertEqual(resp.json()['code'], 0)
         self.assertFalse(self.client.post(
-            '/api/auth/login', {'phone': '13900000003', 'password': 'pass1234'}, format='json'
+            '/api/auth/login', {'email': 'athlete@test.com', 'password': 'pass1234'}, format='json'
         ).json()['success'])
         self.assertTrue(self.client.post(
-            '/api/auth/login', {'phone': '13900000003', 'password': 'newpass99'}, format='json'
+            '/api/auth/login', {'email': 'athlete@test.com', 'password': 'newpass99'}, format='json'
         ).json()['success'])
 
     def test_invalid_jwt_maps_to_20001_with_chinese_message(self):
@@ -144,5 +155,101 @@ class AuthSecurityTest(TestCase):
         resp = self.client.get('/api/health', HTTP_ORIGIN='http://localhost:8083')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp['Access-Control-Allow-Origin'], 'http://localhost:8083')
+
+
+class EmailAuthTest(TestCase):
+    """邮箱注册 / 找回密码 / 换绑邮箱 / 验证码风控。"""
+
+    def setUp(self):
+        self.client = APIClient()
+
+    def send_code(self, email, scene):
+        from unittest.mock import patch
+
+        with patch('apps.accounts.verification._generate_code', return_value='123456'):
+            resp = self.client.post('/api/auth/email/send',
+                                    {'email': email, 'scene': scene}, format='json')
+        return resp
+
+    def test_register_with_email_code(self):
+        self.assertEqual(self.send_code('new@test.com', 'register').json()['code'], 0)
+        resp = self.client.post('/api/auth/register', {
+            'name': '新球员', 'email': 'new@test.com', 'password': 'pass1234',
+            'role': 'athlete', 'code': '123456',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+
+        user = User.objects.get(email='new@test.com')
+        self.assertEqual(user.username, 'new@test.com')
+        self.assertIsNone(user.phone)
+        self.assertTrue(user.check_password('pass1234'))
+
+    def test_register_wrong_code_rejected(self):
+        self.assertEqual(self.send_code('bad@test.com', 'register').json()['code'], 0)
+        resp = self.client.post('/api/auth/register', {
+            'name': '错码', 'email': 'bad@test.com', 'password': 'pass1234',
+            'role': 'athlete', 'code': '000000',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertFalse(User.objects.filter(email='bad@test.com').exists())
+
+    def test_register_existing_email_rejected_on_send(self):
+        User.objects.create_user(username='taken@test.com', email='taken@test.com',
+                                 name='已有', role=UserRole.ATHLETE, password='pass1234')
+        resp = self.send_code('taken@test.com', 'register')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_send_code_cooldown(self):
+        self.assertEqual(self.send_code('cool@test.com', 'register').json()['code'], 0)
+        resp = self.send_code('cool@test.com', 'register')
+        self.assertEqual(resp.json()['code'], 40001)
+        self.assertIn('频繁', resp.json()['msg'])
+
+    def test_password_reset(self):
+        User.objects.create_user(username='reset@test.com', email='reset@test.com',
+                                 name='待重置', role=UserRole.ATHLETE, password='pass1234')
+        self.assertEqual(self.send_code('reset@test.com', 'reset_password').json()['code'], 0)
+        resp = self.client.post('/api/auth/password/reset', {
+            'email': 'reset@test.com', 'code': '123456', 'new_password': 'newpass99',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+
+        login = self.client.post('/api/auth/login',
+                                 {'email': 'reset@test.com', 'password': 'newpass99'}, format='json')
+        self.assertEqual(login.json()['code'], 0, login.json())
+
+    def test_reset_unknown_email_rejected(self):
+        resp = self.send_code('nobody@test.com', 'reset_password')
+        self.assertEqual(resp.json()['code'], 10001)
+
+    def test_change_email_then_login_with_new_email(self):
+        user = User.objects.create_user(username='old@test.com', email='old@test.com',
+                                        name='换绑', role=UserRole.ATHLETE, password='pass1234')
+        self.client.credentials(
+            HTTP_AUTHORIZATION=f'Bearer {access_token(user)}'
+        )
+        self.assertEqual(self.send_code('newmail@test.com', 'change_email').json()['code'], 0)
+        resp = self.client.post('/api/auth/email/change',
+                                {'email': 'newmail@test.com', 'code': '123456'}, format='json')
+        self.assertEqual(resp.json()['code'], 0, resp.json())
+
+        user.refresh_from_db()
+        self.assertEqual(user.email, 'newmail@test.com')
+        self.assertIsNotNone(user.email_verified_at)
+
+        login = self.client.post('/api/auth/login',
+                                 {'email': 'newmail@test.com', 'password': 'pass1234'}, format='json')
+        self.assertEqual(login.json()['code'], 0, login.json())
+
+    def test_placeholder_email_account_cannot_change_password(self):
+        user = User.objects.create_user(username='ph@placeholder.local', email='ph@placeholder.local',
+                                        name='占位', role=UserRole.ATHLETE, password='pass1234')
+        AthleteProfile.objects.create(user=user, name='占位', status='approved')
+        self.client.credentials(HTTP_AUTHORIZATION=f'Bearer {access_token(user)}')
+        resp = self.client.post('/api/auth/password', {
+            'old_password': 'pass1234', 'new_password': 'newpass99', 'code': '123456',
+        }, format='json')
+        self.assertEqual(resp.json()['code'], 10001)
+        self.assertIn('未绑定', resp.json()['msg'])
 
 

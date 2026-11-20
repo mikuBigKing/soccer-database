@@ -19,6 +19,7 @@ from django.utils import timezone
 from apps.accounts.models import (
     AthleteProfile, CoachProfile, EligibilityStatus, ProfileStatus, UserRole, UserStatus,
 )
+from apps.accounts.utils import placeholder_email
 from apps.common.codes import ResponseCode
 from apps.common.exceptions import BusinessException
 from apps.common.formatting import format_dt
@@ -93,20 +94,12 @@ def _log(request, action: str, target_type: str, target_id: int, before=None, af
 
 
 def _sync_user_phone(user, new_phone: str) -> bool:
-    """同步账号手机号与登录标识（注册约定 `username = phone`）。
-
-    返回是否发生变化。手机号 / username 均查重并排除自己：
-    - 手机号冲突：`phone: 该手机号已被使用`
-    - username 冲突：`username: 该手机号已被占用`
-    """
-    if user.phone == new_phone and user.username == new_phone:
+    """同步账号手机号（登录标识已改为邮箱，username 不再随手机号变化）。"""
+    if user.phone == new_phone:
         return False
     if User.objects.filter(phone=new_phone).exclude(pk=user.pk).exists():
         raise BusinessException(ResponseCode.PARAM_INVALID, 'phone: 该手机号已被使用')
-    if User.objects.filter(username=new_phone).exclude(pk=user.pk).exists():
-        raise BusinessException(ResponseCode.PARAM_INVALID, 'username: 该手机号已被占用')
     user.phone = new_phone
-    user.username = new_phone
     return True
 
 
@@ -193,8 +186,6 @@ def _ensure_phone_available(phone: str, exclude_user_id=None) -> None:
         qs = qs.exclude(pk=exclude_user_id)
     if qs.exists():
         raise BusinessException(ResponseCode.PARAM_INVALID, 'phone: 该手机号已被使用')
-    if User.objects.filter(username=phone).exclude(pk=exclude_user_id or 0).exists():
-        raise BusinessException(ResponseCode.PARAM_INVALID, 'username: 该手机号已被占用')
 
 
 def _get_school(school_id):
@@ -323,7 +314,8 @@ def create_player(request, data: dict) -> dict:
     school = _get_school(data['school_id']) if data.get('school_id') else None
     _ensure_school_in_scope(request.user, school)
     user = User.objects.create_user(
-        username=phone,
+        username=placeholder_email(phone),
+        email=placeholder_email(phone),
         phone=phone,
         role=UserRole.ATHLETE,
         name=data['name'],
@@ -1663,7 +1655,9 @@ def import_players(request, file) -> dict:
                 _ensure_id_card_available(data['id_card'], AthleteProfile, None)
                 school = _get_school_by_name(data['school_name'])
                 user = User.objects.create_user(
-                    username=data['phone'], phone=data['phone'],
+                    username=placeholder_email(data['phone']),
+                    email=placeholder_email(data['phone']),
+                    phone=data['phone'],
                     role=UserRole.ATHLETE, name=data['name'],
                     password=settings.DEFAULT_RESET_PASSWORD,
                 )
